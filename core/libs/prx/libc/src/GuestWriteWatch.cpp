@@ -38,6 +38,83 @@
 #define APS5_GUEST_WRITE_WATCH 1
 #endif
 
+#if defined(__linux__)
+#include <dlfcn.h>
+#include <string>
+namespace GuestWriteWatch {
+namespace {
+// Нативная группа под box64 (APK): uffd-wp нет, отслеживание записей — в нативном coreshim
+// (WriteWatchNative.cpp: mprotect + нативный SIGSEGV). Вызовы x86-ядра уходят туда через мост box64.
+struct NativeWatch {
+    using Call = std::uint64_t (*)(void*, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
+    Call call = nullptr;
+    void* available = nullptr;
+    void* registerRange = nullptr;
+    void* unregisterRange = nullptr;
+    void* beginHost = nullptr;
+    void* endHost = nullptr;
+    void* protectionChanged = nullptr;
+    void* protection = nullptr;
+    bool ok = false;
+
+    std::uint64_t operator()(void* function, std::uint64_t a = 0, std::uint64_t b = 0, std::uint64_t c = 0) const {
+        return call(function, a, b, c, 0, 0, 0, 0, 0);
+    }
+};
+
+std::string libraryDirectory() {
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<void*>(&libraryDirectory), &info) == 0 || info.dli_fname == nullptr) return ".";
+    std::string path = info.dli_fname;
+    const auto slash = path.rfind('/');
+    return slash == std::string::npos ? std::string(".") : path.substr(0, slash);
+}
+
+bool uffdAvailable();
+
+const NativeWatch& nativeWatch() {
+    static const NativeWatch watch = [] {
+        NativeWatch result;
+        if (uffdAvailable() || std::getenv("APS5_NO_WRITE_WATCH") != nullptr) return result;
+        void* bridge = dlopen("libaps5bridge.so", RTLD_NOW);
+        if (bridge == nullptr) {
+            std::fprintf(stderr, "[memory] write watch: no libaps5bridge.so (%s)\n", dlerror());
+            return result;
+        }
+        const auto load = reinterpret_cast<void* (*)(const char*)>(dlsym(bridge, "aps5b_load"));
+        const auto symbol = reinterpret_cast<void* (*)(void*, const char*)>(dlsym(bridge, "aps5b_sym"));
+        result.call = reinterpret_cast<NativeWatch::Call>(dlsym(bridge, "aps5b_call"));
+        if (load == nullptr || symbol == nullptr || result.call == nullptr) return result;
+        const char* directory = std::getenv("APS5_NATIVE_DIR");
+        const std::string path = (directory != nullptr ? std::string(directory) : libraryDirectory() + "/native") + "/libaps5coreshim.so";
+        void* shim = load(path.c_str());
+        if (shim == nullptr) {
+            std::fprintf(stderr, "[memory] write watch: cannot load %s\n", path.c_str());
+            return result;
+        }
+        result.available = symbol(shim, "Aps5WatchAvailable");
+        result.registerRange = symbol(shim, "Aps5WatchRegister");
+        result.unregisterRange = symbol(shim, "Aps5WatchUnregister");
+        result.beginHost = symbol(shim, "Aps5WatchBeginHostWrite");
+        result.endHost = symbol(shim, "Aps5WatchEndHostWrite");
+        result.protectionChanged = symbol(shim, "Aps5WatchProtectionChanged");
+        result.protection = symbol(shim, "Aps5WatchProtection");
+        if (!result.available) std::fprintf(stderr, "[memory] write watch: %s has no Aps5Watch* entry points\n", path.c_str());
+        if (!result.available || !result.registerRange || !result.unregisterRange || !result.beginHost || !result.endHost || !result.protectionChanged || !result.protection) return result;
+        result.ok = result(result.available) != 0;
+        std::fprintf(stderr, "[memory] write watch: %s\n", result.ok ? "native mprotect watch (coreshim)" : "native watch unavailable");
+        return result;
+    }();
+    return watch;
+}
+
+std::uint64_t raw(const void* pointer) {
+    return reinterpret_cast<std::uintptr_t>(pointer);
+}
+}
+}
+#endif
+
 namespace GuestWriteWatch {
 namespace {
 
@@ -602,7 +679,22 @@ const bool g_opened = (Watch::Get(), true);
 
 }
 
+#if defined(__linux__)
+namespace {
+bool uffdAvailable() {
+#ifdef APS5_GUEST_WRITE_WATCH
+    return Watch::Get().Available();
+#else
+    return false;
+#endif
+}
+}
+#endif
+
 bool GuestWriteWatchAvailable_nid_postfix() {
+#if defined(__linux__)
+    if (nativeWatch().ok) return true;
+#endif
 #ifdef APS5_GUEST_WRITE_WATCH
     return Watch::Get().Available();
 #else
@@ -611,6 +703,12 @@ bool GuestWriteWatchAvailable_nid_postfix() {
 }
 
 void GuestWriteWatchRegister_nid_postfix(const void* pointer, std::size_t bytes) {
+#if defined(__linux__)
+    if (const auto& native = nativeWatch(); native.ok) {
+        native(native.registerRange, raw(pointer), bytes);
+        return;
+    }
+#endif
 #ifdef APS5_GUEST_WRITE_WATCH
     const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
     Watch::Get().Register(begin, begin + bytes);
@@ -621,6 +719,9 @@ void GuestWriteWatchRegister_nid_postfix(const void* pointer, std::size_t bytes)
 }
 
 bool GuestWriteWatchUnregister_nid_postfix(const void* pointer, std::size_t bytes) {
+#if defined(__linux__)
+    if (const auto& native = nativeWatch(); native.ok) return native(native.unregisterRange, raw(pointer), bytes) != 0;
+#endif
 #ifdef APS5_GUEST_WRITE_WATCH
     const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
     return Watch::Get().Unregister(begin, begin + bytes);
@@ -655,6 +756,12 @@ bool GuestWriteWatchCollect_nid_postfix(std::uintptr_t address, std::size_t byte
 }
 
 void GuestWriteWatchBeginHostWrite_nid_postfix(const void* pointer, std::size_t bytes) {
+#if defined(__linux__)
+    if (const auto& native = nativeWatch(); native.ok) {
+        native(native.beginHost, raw(pointer), bytes);
+        return;
+    }
+#endif
 #if defined(__APPLE__)
     const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
     Watch::Get().BeginHostWrite(begin, begin + bytes);
@@ -665,6 +772,12 @@ void GuestWriteWatchBeginHostWrite_nid_postfix(const void* pointer, std::size_t 
 }
 
 void GuestWriteWatchEndHostWrite_nid_postfix(const void* pointer, std::size_t bytes) {
+#if defined(__linux__)
+    if (const auto& native = nativeWatch(); native.ok) {
+        native(native.endHost, raw(pointer), bytes);
+        return;
+    }
+#endif
 #if defined(__APPLE__)
     const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
     Watch::Get().EndHostWrite(begin, begin + bytes);
@@ -675,6 +788,12 @@ void GuestWriteWatchEndHostWrite_nid_postfix(const void* pointer, std::size_t by
 }
 
 void GuestWriteWatchProtectionChanged_nid_postfix(const void* pointer, std::size_t bytes, int protection) {
+#if defined(__linux__)
+    if (const auto& native = nativeWatch(); native.ok) {
+        native(native.protectionChanged, raw(pointer), bytes, static_cast<std::uint64_t>(protection));
+        return;
+    }
+#endif
 #if defined(__APPLE__)
     const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
     Watch::Get().ProtectionChanged(begin, begin + bytes, protection);
@@ -686,6 +805,9 @@ void GuestWriteWatchProtectionChanged_nid_postfix(const void* pointer, std::size
 }
 
 int GuestWriteWatchProtection_nid_postfix(std::uintptr_t address, std::uintptr_t limit, std::uintptr_t* runEnd) {
+#if defined(__linux__)
+    if (const auto& native = nativeWatch(); native.ok) return static_cast<int>(static_cast<std::int64_t>(native(native.protection, address, limit, raw(runEnd))));
+#endif
 #if defined(__APPLE__)
     return Watch::Get().Protection(address, limit, runEnd);
 #else

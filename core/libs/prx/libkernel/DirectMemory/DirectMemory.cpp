@@ -885,9 +885,11 @@ int DoMprotect(const void* addr, size_t len, int prot) {
 #else
     mutation.RegisterMainImage();
 #endif
-    mutation.Protect(pointer, bytes, (prot & 3) != 0, (prot & 2) != 0, (prot & GuestProtGpuReadWrite) != 0, [&] {
+    mutation.ProtectKeep(pointer, bytes, (prot & 3) != 0, (prot & 2) != 0, (prot & GuestProtGpuReadWrite) != 0, [&] {
         if (mprotect(const_cast<void*>(pointer), bytes, nativeProtection) != 0) throw std::system_error(errno, std::generic_category(), "mprotect failed");
     });
+    // Отслеживание записей держит права страниц у себя (снимает запись для наблюдения).
+    GuestWriteWatch::GuestWriteWatchProtectionChanged_nid_postfix(pointer, bytes, nativeProtection);
     RecordProtection(pointer, bytes, prot);
     return 0;
 }

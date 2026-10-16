@@ -155,7 +155,7 @@ VkPipeline TextureDetiler::pipeline(TextureTileMode tileMode, std::uint32_t elem
         values[21] = extent[1];
     } else if (const auto mode = EquationSwizzleMode(tileMode); mode != 0) {
         const auto* equation = FindTextureSwizzleEquation(mode, elementBytes);
-        if (equation == nullptr) Require(false, "no swizzle equation for tile mode " + std::to_string(mode) + " at " + std::to_string(elementBytes) + " bytes per element");
+        if (equation == nullptr) Fail("no swizzle equation for tile mode " + std::to_string(mode) + " at " + std::to_string(elementBytes) + " bytes per element");
         values[2] = 2u;
         std::copy(equation->bits.begin(), equation->bits.end(), values.begin() + 4);
     }
@@ -191,7 +191,7 @@ void TextureDetiler::checkWindow(const TileMipLayout& layout, const DetileWindow
     Require(layout.tiledSize != 0 && layout.linearSize != 0, "texture detiling requires a non-empty mip layout");
     columnEnd = window.columnEnd != 0 ? std::min(window.columnEnd, layout.width) : layout.width;
     rowEnd = window.rowEnd != 0 ? std::min(window.rowEnd, layout.height) : layout.height;
-    if (!(window.columnBegin < columnEnd && window.rowBegin < rowEnd)) Require(false, "texture detiling window lies outside the mip: columns " + std::to_string(window.columnBegin) + ".." + std::to_string(columnEnd) + ", rows " + std::to_string(window.rowBegin) + ".." + std::to_string(rowEnd) + " of " + std::to_string(layout.width) + "x" + std::to_string(layout.height));
+    if (!(window.columnBegin < columnEnd && window.rowBegin < rowEnd)) Fail("texture detiling window lies outside the mip: columns " + std::to_string(window.columnBegin) + ".." + std::to_string(columnEnd) + ", rows " + std::to_string(window.rowBegin) + ".." + std::to_string(rowEnd) + " of " + std::to_string(layout.width) + "x" + std::to_string(layout.height));
 }
 
 void TextureDetiler::Dispatch(VkCommandBuffer commands, TextureTileMode tileMode, std::uint32_t elementBytes, VkBuffer source, std::uint64_t sourceOffset, VkBuffer destination, std::uint64_t destinationOffset, const TileMipLayout& layout, bool retile, std::uint32_t slice, bool thick, const DetileWindow& window) {

@@ -169,11 +169,14 @@ private:
         std::ifstream maps("/proc/self/maps");
         if (!maps.is_open()) throw std::runtime_error("guest arena: cannot open /proc/self/maps");
         std::string line;
+        std::uintptr_t highest = 0;
         while (std::getline(maps, line)) {
             std::istringstream fields(line);
             std::uintptr_t begin = 0, end = 0;
             char dash = 0;
-            if (!(fields >> std::hex >> begin >> dash >> end) || dash != '-' || end <= begin) throw std::runtime_error("guest arena: malformed /proc/self/maps line: " + line);
+            if (!(fields >> std::hex >> begin >> dash >> end) || dash != '-' || end < begin) throw std::runtime_error("guest arena: malformed /proc/self/maps line: " + line);
+            if (end == begin) continue; // Android: пустые записи (bionic libdl.so и т.п.)
+            if (line.find("[vsyscall]") == std::string::npos) highest = std::max(highest, end);
             if (end <= ArenaStart || begin >= ApplicationAreaEnd) continue;
             const auto first = std::max(begin, ArenaStart);
             const auto last = std::min(end, ApplicationAreaEnd);
@@ -182,9 +185,16 @@ private:
         }
         _used.emplace(SystemReservedStart, SystemReservedEnd);
         _hostRegions.emplace_back(SystemReservedStart, SystemReservedEnd);
+        // The host may have less address space than the console's application
+        // area: Android arm64 kernels give 39 bits (512 GiB). The highest
+        // mapping (the stack, near the top) rounded up to a power of two is
+        // the ceiling; on a 47-bit host it is above the area and changes nothing.
+        std::uintptr_t ceiling = 1;
+        while (ceiling != 0 && ceiling < highest) ceiling <<= 1;
+        _limit = ceiling == 0 ? ApplicationAreaEnd : std::min(ceiling, ApplicationAreaEnd);
         ReserveFreeRanges();
         _base = ArenaStart;
-        _end = ApplicationAreaEnd;
+        _end = _limit;
     }
 
     static void TryReserve(std::vector<std::pair<std::uintptr_t, std::uintptr_t>>& occupied, std::uintptr_t from, std::uintptr_t to) {
@@ -211,12 +221,12 @@ private:
         std::vector<std::pair<std::uintptr_t, std::uintptr_t>> occupied;
         std::uintptr_t cursor = ArenaStart;
         for (const auto& [usedStart, usedEnd] : _used) {
-            if (usedStart > ApplicationAreaEnd) break;
-            if (usedStart > cursor) TryReserve(occupied, cursor, std::min(usedStart, ApplicationAreaEnd));
+            if (usedStart > _limit) break;
+            if (usedStart > cursor) TryReserve(occupied, cursor, std::min(usedStart, _limit));
             if (usedEnd > cursor) cursor = usedEnd;
-            if (cursor >= ApplicationAreaEnd) break;
+            if (cursor >= _limit) break;
         }
-        if (cursor < ApplicationAreaEnd) TryReserve(occupied, cursor, ApplicationAreaEnd);
+        if (cursor < _limit) TryReserve(occupied, cursor, _limit);
         for (const auto& [from, to] : occupied) {
             _used.emplace(from, to);
             _hostRegions.emplace_back(from, to);
@@ -230,6 +240,7 @@ private:
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> _hostRegions;
     std::uintptr_t _base = 0;
     std::uintptr_t _end = 0;
+    std::uintptr_t _limit = ApplicationAreaEnd;
     bool _writeWatched = false;
 
 public:

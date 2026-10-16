@@ -35,7 +35,7 @@ Registers::const_iterator find(const Registers& registers, std::uint32_t offset,
 
 float readFloat(const Registers& registers, std::uint32_t offset) {
     const auto value = std::bit_cast<float>(read(registers, offset));
-    if (!std::isfinite(value)) Require(false, "non-finite register at DWORD " + std::to_string(offset));
+    if (!std::isfinite(value)) Fail("non-finite register at DWORD " + std::to_string(offset));
     return value;
 }
 
@@ -132,6 +132,20 @@ bool IgnoreDepthTest() {
     return ignore;
 }
 
+// Multisampling (PA_SC_AA_CONFIG) is not emulated; with APS5_IGNORE_MSAA the
+// draw is rasterized with one sample instead of being refused.
+bool IgnoreMultisampling(const Registers& cx) {
+    static const bool ignore = std::getenv("APS5_IGNORE_MSAA") != nullptr;
+    if (!ignore) return false;
+    static bool reported = false;
+    if (!reported) {
+        reported = true;
+        const auto aa = cx.find(0x2f8);
+        std::fprintf(stderr, "[gpu] multisampling is ignored (APS5_IGNORE_MSAA; PA_SC_AA_CONFIG=0x%08x)\n", aa == cx.end() ? 0u : aa->second);
+    }
+    return true;
+}
+
 bool depthSurfaceBound(const Registers& cx) {
     const auto z = find(cx, 0x010);
     const auto stencil = find(cx, 0x011);
@@ -199,7 +213,9 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result)
     const bool stencilClear = (read(cx, 0x000) & 2u) != 0;
     const auto view = read(cx, 0x002);
     zero(cx, 0x002, 0x3c000000u, "depth mips (DB_DEPTH_VIEW MIP_LEVEL)");
-    zero(cx, 0x010, 0x000f100cu, "multisampled, partially resident or mipmapped depth (DB_Z_INFO)");
+    // NUM_SAMPLES (bits 2-3): with APS5_IGNORE_MSAA the depth plane is used with one sample, like
+    // the color targets.
+    zero(cx, 0x010, IgnoreMultisampling(cx) ? 0x000f1000u : 0x000f100cu, "multisampled, partially resident or mipmapped depth (DB_Z_INFO)");
     zero(cx, 0x011, 0x00001000u, "partially resident stencil (DB_STENCIL_INFO)");
     const auto zFormat = read(cx, 0x010) & 3u;
     const bool stencil = (read(cx, 0x011) & 1u) != 0;
@@ -602,8 +618,8 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
     zero(cx, 0x203, shaderControlMask(read(cx, 0x1c4)), "depth export, shader coverage or ordered fragment execution");
     result.alphaToCoverage = read(cx, 0x2dc) == AlphaToCoverageUndithered;
     if (!result.alphaToCoverage) zero(cx, 0x2dc, AlphaToCoverageMask, "dithered or rounded alpha-to-coverage");
-    zero(cx, 0x2f8, ~0u, "multisampling or coverage conversion");
-    zero(cx, 0x292, ScanModeMask, "scan conversion mode");
+    if (!IgnoreMultisampling(cx)) zero(cx, 0x2f8, ~0u, "multisampling or coverage conversion");
+    zero(cx, 0x292, IgnoreMultisampling(cx) ? ScanModeMask & ~1u : ScanModeMask, "scan conversion mode");
     zero(cx, 0x293, ScanControlMask, "sample iteration, primitive discard or out-of-order rasterization");
     zero(cx, 0x80, ~0u, "window offset");
     zero(cx, 0x8d, ScreenOffsetMask, "reserved PA_SU_HARDWARE_SCREEN_OFFSET bits");
@@ -838,7 +854,7 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     const auto slice = view & 0x1fffu;
     Require(slice == ((view >> 13u) & 0x1fffu), "color views of several array slices are unsupported");
     const auto viewMip = (view >> 26u) & 0xfu;
-    zero(cx, 0x31d + stride, ~0x20000u, "color samples, fragments or destination alpha override");
+    zero(cx, 0x31d + stride, IgnoreMultisampling(cx) ? ~0x3f000u : ~0x20000u, "color samples, fragments or destination alpha override");
     const auto attrib2 = read(cx, 0x3b0 + slot);
     const auto maxMip = attrib2 >> 28u;
     Require(viewMip <= maxMip, "color view mip exceeds the surface");
@@ -916,6 +932,16 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     return color;
 }
 
+std::optional<ColorResolvePass> DecodeColorResolvePass(const QueueState& queue) {
+    const auto& cx = queue.context;
+    const auto control = find(cx, 0x202);
+    if (control == cx.end() || ((control->second >> 4u) & 7u) != 3u || !IgnoreMultisampling(cx)) return std::nullopt;
+    auto source = DecodeColorBuffer(cx, 0);
+    auto destination = DecodeColorBuffer(cx, 1);
+    Require(source.bytes == destination.bytes && source.format == destination.format, "MSAA resolve between color targets of different size or format");
+    return ColorResolvePass{source, destination};
+}
+
 std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue) {
     const auto& cx = queue.context;
     const auto control = find(cx, 0x202);
@@ -925,7 +951,7 @@ std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue
     ColorMetadataPass pass{mode == 2u ? ColorMetadataPass::Mode::EliminateFastClear : ColorMetadataPass::Mode::DccDecompress, {}};
     Require((control->second & ~0x70u) == 0xcc0000u, "CB metadata pass with a nonstandard ROP, dual quads disabled or degamma");
     Require((read(cx, 0x200) & 0xfu) == 0 && (read(cx, 0x0) & 0xfu) == 0, "CB metadata pass with depth or stencil work");
-    zero(cx, 0x2f8, ~0u, "multisampling or coverage conversion");
+    if (!IgnoreMultisampling(cx)) zero(cx, 0x2f8, ~0u, "multisampling or coverage conversion");
     zero(cx, 0x80, ~0u, "window offset");
     const auto viewportControl = read(cx, 0x206);
     if (viewportControl != 0x43fu) throw std::runtime_error(vteMessage(viewportControl));
@@ -1000,8 +1026,8 @@ std::string DrawRejection(const QueueState& queue, bool indexed) {
     if (value(cx, 0x2dc, word) && word != AlphaToCoverageUndithered) {
         if (auto reason = nonzero(cx, 0x2dc, AlphaToCoverageMask, "dithered or rounded alpha-to-coverage"); !reason.empty()) return reason;
     }
-    if (auto reason = nonzero(cx, 0x2f8, ~0u, "multisampling or coverage conversion"); !reason.empty()) return reason;
-    if (auto reason = nonzero(cx, 0x292, ScanModeMask, "scan conversion mode"); !reason.empty()) return reason;
+    if (!IgnoreMultisampling(cx)) if (auto reason = nonzero(cx, 0x2f8, ~0u, "multisampling or coverage conversion"); !reason.empty()) return reason;
+    if (auto reason = nonzero(cx, 0x292, IgnoreMultisampling(cx) ? ScanModeMask & ~1u : ScanModeMask, "scan conversion mode"); !reason.empty()) return reason;
     if (auto reason = nonzero(cx, 0x293, ScanControlMask, "sample iteration, primitive discard or out-of-order rasterization"); !reason.empty()) return reason;
     if (auto reason = nonzero(cx, 0x80, ~0u, "window offset"); !reason.empty()) return reason;
     if (auto reason = nonzero(cx, 0x8d, ScreenOffsetMask, "reserved PA_SU_HARDWARE_SCREEN_OFFSET bits"); !reason.empty()) return reason;

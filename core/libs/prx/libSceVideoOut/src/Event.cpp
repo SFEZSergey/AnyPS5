@@ -61,7 +61,7 @@ static int registerVideoOutEvent(int handle, KernelEqueue eq, int16_t eventKind,
         triggered.fflags = triggered.fflags < 0xfu ? triggered.fflags + 1u : triggered.fflags;
         triggered.data = static_cast<intptr_t>(newData);
         if (e->triggered) {
-            e->pendingEvents.push_back(triggered);
+            EqueuePushPending_nid_postfix(e, &triggered);
         } else {
             e->event = triggered;
             e->triggered = true;

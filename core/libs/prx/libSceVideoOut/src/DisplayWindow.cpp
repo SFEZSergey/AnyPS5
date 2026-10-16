@@ -6,6 +6,7 @@
 #include "Decoder/Png.hpp"
 #include "SDL_vulkan.h"
 #include <cstdio>
+#include <cstdlib>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -118,6 +119,9 @@ void DisplayWindow::UpdateTitle() {
         currentFps = static_cast<double>(fpsFrames) * static_cast<double>(frequency) / static_cast<double>(now - fpsStart);
         fpsStart = now;
         fpsFrames = 0;
+        // Без заголовков окон (Termux:X11) FPS иначе не увидеть: APS5_LOG_FPS=1 печатает его в stderr.
+        static const bool logFps = std::getenv("APS5_LOG_FPS") != nullptr;
+        if (logFps) std::fprintf(stderr, "[fps] %.2f (frame %llu)\n", currentFps, static_cast<unsigned long long>(frameNum));
     }
     char text[160];
     std::snprintf(text, sizeof(text), "%s | FPS: %.2f (%llu)", title.value, currentFps, static_cast<unsigned long long>(frameNum));

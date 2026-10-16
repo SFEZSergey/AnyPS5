@@ -1,3 +1,7 @@
+#include <mutex>
+#include <map>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
@@ -60,6 +64,37 @@ int FindRelinkedImage(dl_phdr_info* image, std::size_t, void* data) {
   return 1;
 }
 
+// Results of sceKernelGetModuleInfoForUnwind by mapping: the game's unwinder asks every frame, and
+// without PROCMAP_QUERY (kernels before 6.11, Android) each answer parsed all of /proc/self/maps
+// (thousands of lines on Android) and walked the modules twice. Module loads and unloads clear it.
+struct UnwindCacheEntry {
+  std::uint64_t end;
+  ModuleInfoForUnwind info;
+};
+std::mutex unwindCacheMutex;
+std::map<std::uint64_t, UnwindCacheEntry> unwindCache;
+
+bool UnwindCacheLookup(std::uint64_t address, ModuleInfoForUnwind* info) {
+  std::lock_guard lock(unwindCacheMutex);
+  auto it = unwindCache.upper_bound(address);
+  if (it == unwindCache.begin()) return false;
+  --it;
+  if (address >= it->second.end) return false;
+  *info = it->second.info;
+  return true;
+}
+
+void UnwindCacheStore(std::uint64_t start, std::uint64_t end, const ModuleInfoForUnwind& info) {
+  std::lock_guard lock(unwindCacheMutex);
+  if (unwindCache.size() >= 4096) unwindCache.clear();
+  unwindCache[start] = {end, info};
+}
+
+void UnwindCacheClear() {
+  std::lock_guard lock(unwindCacheMutex);
+  unwindCache.clear();
+}
+
 bool IsRelinkedImage(std::uint64_t address) {
   ImageSearch search{address, false};
   dl_iterate_phdr(FindRelinkedImage, &search);
@@ -93,6 +128,8 @@ extern "C" {
 int APS5_VABI sceKernelDlsym(KernelModule handle, const char* symbol, void** addr) {
  if (!symbol || !addr) return SCE_KERNEL_ERROR_EFAULT;
  void* found = dlsym_nid_postfix(reinterpret_cast<void*>(static_cast<intptr_t>(handle)), symbol);
+ static const bool trace = std::getenv("APS5_TRACE_DLSYM") != nullptr;
+ if (trace) std::fprintf(stderr, "[dlsym] handle=%d %s -> %p\n", handle, symbol, found);
  if (!found) return SCE_KERNEL_ERROR_ESRCH;
  *addr = found;
  return 0;
@@ -163,6 +200,8 @@ int APS5_VABI sceKernelGetModuleInfoForUnwind(uint64_t addr, int flags, ModuleIn
   info->seg0_size = textSize;
   return 0;
 #else
+  static const bool cached = std::getenv("APS5_NO_UNWIND_CACHE") == nullptr;
+  if (cached && UnwindCacheLookup(addr, info)) return 0;
   const auto mapping = HostMapping::Find(addr, "sceKernelGetModuleInfoForUnwind");
   if (!mapping) return SCE_KERNEL_ERROR_ESRCH;
   info->st_size = sizeof(ModuleInfoForUnwind);
@@ -174,6 +213,7 @@ int APS5_VABI sceKernelGetModuleInfoForUnwind(uint64_t addr, int flags, ModuleIn
   info->seg0_addr = mapping->start;
   info->seg0_size = mapping->end - mapping->start;
   if (IsRelinkedImage(addr)) FillGuestUnwindInfo(addr, info);
+  if (cached && !mapping->path.empty()) UnwindCacheStore(mapping->start, mapping->end, *info);
   return 0;
 #endif
 }
@@ -208,6 +248,9 @@ KernelModule APS5_VABI sceKernelLoadStartModule(const char* module_file_name, si
  if (!module_file_name) return static_cast<KernelModule>(SCE_KERNEL_ERROR_EFAULT);
  pendingModuleArgs = {args, argp};
  pendingModuleInitResult = 0;
+#if !defined(_WIN32) && !defined(__APPLE__)
+ UnwindCacheClear();
+#endif
  void* handle = dlopen_nid_postfix(module_file_name, kRtldNow);
  const int started = pendingModuleInitResult;
  pendingModuleArgs = {};
@@ -223,6 +266,9 @@ int APS5_VABI sceKernelStopUnloadModule(KernelModule handle, size_t args, const 
  (void)flags;
  (void)opt;
  if (res) *res = 0;
+#if !defined(_WIN32) && !defined(__APPLE__)
+ UnwindCacheClear();
+#endif
  return dlclose_nid_postfix(reinterpret_cast<void*>(static_cast<intptr_t>(handle))) == 0 ? 0 : SCE_KERNEL_ERROR_ESRCH;
 }
 

@@ -26,7 +26,23 @@ struct JsonValue {
     std::string stringValue;
     JsonArray arrayValue;
     JsonObject objectValue;
+
+    // Defined below, where JsonValue is complete: Clang instantiates the
+    // members of std::pair<std::string, JsonValue> eagerly.
+    JsonValue();
+    JsonValue(const JsonValue&);
+    JsonValue(JsonValue&&) noexcept;
+    JsonValue& operator=(const JsonValue&);
+    JsonValue& operator=(JsonValue&&) noexcept;
+    ~JsonValue();
 };
+
+JsonValue::JsonValue() = default;
+JsonValue::JsonValue(const JsonValue&) = default;
+JsonValue::JsonValue(JsonValue&&) noexcept = default;
+JsonValue& JsonValue::operator=(const JsonValue&) = default;
+JsonValue& JsonValue::operator=(JsonValue&&) noexcept = default;
+JsonValue::~JsonValue() = default;
 
 std::string readFileToString(const std::filesystem::path& path) {
     std::ifstream file(path, std::ios::binary);

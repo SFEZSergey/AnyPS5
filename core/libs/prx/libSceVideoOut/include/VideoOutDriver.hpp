@@ -130,6 +130,8 @@ struct VideoOutConfig {
     std::stop_token shutdownToken = LibcShutdownToken_nid_postfix();
     int flipRate = 0;
     uint64_t lastFlipVblank = 0;
+    // APS5_FPS_LIMIT: the earliest vblank (fractional) the next flip of this port may take.
+    double fpsLimitNext = 0.0;
     std::chrono::steady_clock::time_point lastTimingFlip{};
     uint64_t outputMode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
     float gamma = 1.0f;

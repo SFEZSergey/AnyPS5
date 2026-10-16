@@ -12,6 +12,7 @@
 #include <fstream>
 #include <pthread.h>
 #include <sched.h>
+#include <algorithm>
 #include <string>
 #include <unistd.h>
 #endif
@@ -99,6 +100,36 @@ inline const Layout& Get() {
         result.performant = MaskFromCpuList("/sys/devices/cpu_core/cpus");
         result.efficient = MaskFromCpuList("/sys/devices/cpu_atom/cpus");
         result.hybrid = result.efficient != 0 && result.performant != 0 && (result.efficient & result.performant) == 0;
+        if (!result.hybrid) {
+            // ARM big.LITTLE / DynamIQ (phones): no cpu_core/cpu_atom; the tiers are told apart by the
+            // cores' maximum frequency. Performant = the fastest tier, widened by the next one when it
+            // is a single core (the driver's queue worker and the presenter should not share one);
+            // efficient = the slowest tier.
+            std::uint64_t freq[64] = {};
+            std::uint64_t top = 0, second = 0, lowest = ~std::uint64_t{0};
+            for (unsigned cpu = 0; cpu < 64; ++cpu) {
+                if (((result.process >> cpu) & 1u) == 0) continue;
+                std::ifstream file("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/cpufreq/cpuinfo_max_freq");
+                std::uint64_t value = 0;
+                if (!(file >> value) || value == 0) continue;
+                freq[cpu] = value;
+                lowest = std::min(lowest, value);
+                if (value > top) { second = top; top = value; }
+                else if (value < top && value > second) second = value;
+            }
+            std::uint64_t topMask = 0, nextMask = 0, lowMask = 0;
+            for (unsigned cpu = 0; cpu < 64; ++cpu) {
+                if (freq[cpu] == 0) continue;
+                if (freq[cpu] == top) topMask |= std::uint64_t{1} << cpu;
+                if (freq[cpu] == second) nextMask |= std::uint64_t{1} << cpu;
+                if (freq[cpu] == lowest) lowMask |= std::uint64_t{1} << cpu;
+            }
+            if (top != 0 && lowest != top) {
+                result.performant = __builtin_popcountll(topMask) >= 2 || nextMask == 0 ? topMask : (topMask | nextMask);
+                result.efficient = lowMask & ~result.performant;
+                result.hybrid = result.performant != 0 && result.efficient != 0;
+            }
+        }
 #endif
         return result;
     }();
@@ -145,7 +176,12 @@ inline std::uint64_t Pin(void* handle, std::uint64_t mask) {
     CPU_ZERO(&set);
     for (unsigned cpu = 0; cpu < 64; ++cpu)
         if ((mask >> cpu) & 1u) CPU_SET(cpu, &set);
+#ifdef __ANDROID__
+    // В bionic нет pthread_setaffinity_np; sched_setaffinity(0) действует на вызывающий поток.
+    return sched_setaffinity(0, sizeof(set), &set) == 0 ? mask : 0;
+#else
     return pthread_setaffinity_np(pthread_self(), sizeof(set), &set) == 0 ? mask : 0;
+#endif
 #else
     (void)handle;
     (void)mask;

@@ -40,11 +40,14 @@ bool GuestAllocationsOverlaps_nid_postfix(void* mutation, const void* pointer, s
 Range GuestAllocationsFind_nid_postfix(void* mutation, const void* pointer);
 void GuestAllocationsRemove_nid_postfix(void* mutation, const void* pointer);
 void GuestAllocationsProtect_nid_postfix(void* mutation, const void* pointer, std::size_t bytes, bool readable, bool writable, bool gpu, const std::function<void()>& apply);
+void GuestAllocationsProtectKeep_nid_postfix(void* mutation, const void* pointer, std::size_t bytes, bool readable, bool writable, bool gpu, const std::function<void()>& apply);
 void GuestAllocationsUnmap_nid_postfix(void* mutation, const void* pointer, std::size_t bytes, const std::function<void(const void*, std::size_t, const void*, bool)>& apply);
 Lease GuestAllocationsAcquire_nid_postfix();
 Lease GuestAllocationsAcquireAll_nid_postfix();
 // Changes whenever a mutation ends, so callers can cache facts about guest mappings between changes.
 std::uint64_t GuestAllocationsGeneration_nid_postfix();
+// Конец читаемого зарегистрированного диапазона, целиком содержащего [begin, end), или 0 — без снимка.
+std::uint64_t GuestAllocationsReadableEnd_nid_postfix(std::uintptr_t begin, std::uintptr_t end);
 // Precise invalidation for such caches: the callback runs, after the generation changed, for every
 // range whose mapping or protection changed (registry mutations and guest heap decommits).
 void GuestAllocationsSetInvalidator_nid_postfix(void (*callback)(std::uintptr_t address, std::size_t bytes));
@@ -79,6 +82,7 @@ public:
     void Remove(const void* pointer) { GuestAllocationsRemove_nid_postfix(handle, pointer); }
     void Unmap(const void* pointer, std::size_t bytes, const std::function<void(const void*, std::size_t, const void*, bool)>& apply) { GuestAllocationsUnmap_nid_postfix(handle, pointer, bytes, apply); }
     void Protect(const void* pointer, std::size_t bytes, bool readable, bool writable, bool gpu, const std::function<void()>& apply) { GuestAllocationsProtect_nid_postfix(handle, pointer, bytes, readable, writable, gpu, apply); }
+    void ProtectKeep(const void* pointer, std::size_t bytes, bool readable, bool writable, bool gpu, const std::function<void()>& apply) { GuestAllocationsProtectKeep_nid_postfix(handle, pointer, bytes, readable, writable, gpu, apply); }
     void NoteGpuMapping(const void* pointer, std::size_t bytes) { GuestAllocationsNoteGpuMapping_nid_postfix(handle, pointer, bytes); }
 
 private:

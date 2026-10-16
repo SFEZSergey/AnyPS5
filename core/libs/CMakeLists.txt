@@ -77,13 +77,20 @@ set(LIBC_PATCHED ${PATCHED_DIR}/libc.prx)
 add_custom_command(
         OUTPUT ${LIBC_PATCHED}
         COMMAND ${CMAKE_COMMAND} -E copy ${LIBC_UNPATCHED} ${LIBC_PATCHED}
-        COMMAND $<TARGET_FILE:nid_patcher> libc ${LIBC_PATCHED}
+        COMMAND nid_patcher libc ${LIBC_PATCHED}
         DEPENDS nid_patcher libc ${LIBC_UNPATCHED}
         COMMENT "Patching NIDs for libc"
 )
 
 file(GLOB LIBS_DIRS LIST_DIRECTORIES true ${CMAKE_CURRENT_SOURCE_DIR}/prx/*)
 list(REMOVE_ITEM LIBS_DIRS ${LIBC_DIR})
+# Библиотеки нативной группы (собираются под aarch64 и вызываются x86-заглушками; см. aps5native).
+# Список должен совпадать с GROUP в tools/gen_native_stubs.py.
+set(APS5_GROUP_LIBS "^(libSceAgcDriver|libSceVideoOut|libScePad|libSceMouse|libSceKeyboard|libSceAudioOut)$")
+# Мост нативной группы (не prx): shim ядра для нативной сборки и x86-сторона для эмулируемой.
+list(REMOVE_ITEM LIBS_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/prx/aps5native)
+set(LIBS_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/prx/aps5native ${CMAKE_CURRENT_BINARY_DIR}/prx/aps5native)
 
 set(PATCHED_OUTPUTS ${LIBC_PATCHED})
 
@@ -91,7 +98,18 @@ foreach(LIB_DIR ${LIBS_DIRS})
     if(IS_DIRECTORY ${LIB_DIR})
         get_filename_component(LIB_NAME ${LIB_DIR} NAME)
 
-        if(EXISTS ${LIB_DIR}/CMakeLists.txt)
+        if(APS5_NATIVE_STUBS AND LIB_NAME MATCHES "${APS5_GROUP_LIBS}")
+            # x86-заглушка (tools/gen_native_stubs.py); x86-хост моста — в заглушке драйвера.
+            set(APS5_STUB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/prx/aps5native)
+            if(LIB_NAME STREQUAL "libSceAgcDriver")
+                add_library(${LIB_NAME} SHARED EXCLUDE_FROM_ALL ${APS5_STUB_DIR}/stubs/${LIB_NAME}.cpp ${APS5_STUB_DIR}/X86Host.cpp)
+                target_link_libraries(${LIB_NAME} PRIVATE ${CMAKE_DL_LIBS})
+            else()
+                add_library(${LIB_NAME} SHARED EXCLUDE_FROM_ALL ${APS5_STUB_DIR}/stubs/${LIB_NAME}.cpp)
+                target_link_libraries(${LIB_NAME} PRIVATE libSceAgcDriver)
+            endif()
+            target_include_directories(${LIB_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        elseif(EXISTS ${LIB_DIR}/CMakeLists.txt)
             set(LIBS_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
             add_subdirectory(${LIB_DIR} ${CMAKE_CURRENT_BINARY_DIR}/prx/${LIB_NAME})
         else()
@@ -100,7 +118,10 @@ foreach(LIB_DIR ${LIBS_DIRS})
             configure_windows_unwind(${LIB_NAME})
         endif()
 
-        if(LIB_NAME STREQUAL "libkernel")
+        if(APS5_NATIVE_GROUP AND LIB_NAME MATCHES "${APS5_GROUP_LIBS}")
+            # Нативная группа: ядро (libc/libkernel) остаётся эмулируемым, вызовы идут через shim.
+            target_link_libraries(${LIB_NAME} PRIVATE aps5coreshim)
+        elseif(LIB_NAME STREQUAL "libkernel")
             target_link_libraries(${LIB_NAME} PRIVATE libc)
         else()
             target_link_libraries(${LIB_NAME} PRIVATE libkernel libc)
@@ -132,7 +153,7 @@ foreach(LIB_DIR ${LIBS_DIRS})
         add_custom_command(
                 OUTPUT ${PATCHED_FILE}
                 COMMAND ${CMAKE_COMMAND} -E copy ${UNPATCHED_FILE} ${PATCHED_FILE}
-                COMMAND $<TARGET_FILE:nid_patcher> ${LIB_NAME} --preserve-exports "${LIBC_UNPATCHED}" "${PATCHED_FILE}"
+                COMMAND nid_patcher ${LIB_NAME} --preserve-exports "${LIBC_UNPATCHED}" "${PATCHED_FILE}"
                 DEPENDS nid_patcher ${LIB_NAME} ${UNPATCHED_FILE} ${LIBC_UNPATCHED}
                 COMMENT "Patching NIDs for ${LIB_NAME}"
         )

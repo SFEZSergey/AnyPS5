@@ -854,7 +854,13 @@ bool ResultMemo() {
     return resultMemo;
 }
 
-constexpr std::size_t ResultMemoEntries = 256;
+// Per source; APS5_RESULT_MEMO_ENTRIES overrides. The SPIR-V is shared (SharedSpirv), so an entry is
+// only its bindings (a few KiB): UI-heavy screens thrashed 256 entries (evictions = misses, 34% hits).
+const std::size_t ResultMemoEntries = [] {
+    const char* value = std::getenv("APS5_RESULT_MEMO_ENTRIES");
+    const auto entries = value != nullptr ? std::strtoull(value, nullptr, 10) : 512ull;
+    return static_cast<std::size_t>(entries != 0 ? entries : 512ull);
+}();
 
 struct ResultMemoCounters {
     std::atomic<std::uint64_t> hits{0}, misses{0}, evictions{0}, populateNanoseconds{0};
@@ -935,6 +941,110 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
     return hash;
 }
 
+namespace {
+// APS5_TRACE_MEMO_DIFF=1: on a result-memo miss, what differs from the previous snapshot of the same
+// variant (buffers / images / samplers / SRT / user data / uniform fill / vertex V#s / push offset),
+// with address-only differences told apart; a [memo-diff] line every 10 s.
+struct MemoDiffSample {
+    ResourceSnapshot snapshot;
+    std::vector<std::array<std::uint32_t, 4>> vertex;
+    std::uint32_t pushOffset = 0;
+};
+struct MemoDiffStats {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, MemoDiffSample> last;
+    std::uint64_t misses = 0, compared = 0;
+    std::uint64_t buffersShape = 0, buffersAddr = 0, buffersOther = 0;
+    std::uint64_t imagesAddr = 0, imagesOther = 0, samplers = 0, srt = 0, userData = 0, uniform = 0;
+    std::uint64_t vertexAddr = 0, vertexOther = 0, push = 0, onlyAddresses = 0;
+    std::array<std::uint64_t, 64> userWords{};
+    std::chrono::steady_clock::time_point reported{};
+};
+bool TraceMemoDiff() {
+    static const bool enabled = std::getenv("APS5_TRACE_MEMO_DIFF") != nullptr;
+    return enabled;
+}
+void NoteMemoMiss(std::uint64_t variantId, const RecompileRequest& request, const ResourceSnapshot& snapshot) {
+    static auto& stats = *new MemoDiffStats();
+    std::lock_guard lock(stats.mutex);
+    ++stats.misses;
+    MemoDiffSample sample{snapshot, {}, request.layout.pushConstantOffsetBytes};
+    if (request.context.vertex) {
+        const auto& vertex = *request.context.vertex;
+        const auto count = std::min<std::uint32_t>(vertex.resourcesNum, ShaderVertexStageInfo::MaxResources);
+        for (std::uint32_t i = 0; i < count; ++i) sample.vertex.push_back({vertex.resources[i].fields[0], vertex.resources[i].fields[1], vertex.resources[i].fields[2], vertex.resources[i].fields[3]});
+    }
+    if (const auto found = stats.last.find(variantId); found != stats.last.end()) {
+        const auto& old = found->second;
+        ++stats.compared;
+        bool other = false, addresses = false;
+        // A buffer V#: base address in dword0 and dword1[15:0]; a T#: dword0 and dword1[7:0].
+        const auto compareDescriptors = [&](const std::vector<DescriptorValue>& a, const std::vector<DescriptorValue>& b, std::uint32_t highMask, std::uint64_t& addr, std::uint64_t& rest, std::uint64_t* shape) {
+            if (a.size() != b.size()) { if (shape) ++*shape; else ++rest; other = true; return; }
+            bool anyAddr = false, anyRest = false;
+            for (std::size_t i = 0; i < a.size(); ++i) {
+                if (a[i] == b[i]) continue;
+                bool restDiffers = a[i].dwordCount != b[i].dwordCount;
+                for (std::uint32_t w = 0; w < 8 && !restDiffers; ++w) {
+                    auto x = a[i].dwords[w], y = b[i].dwords[w];
+                    if (w == 0) continue;
+                    if (w == 1) { x &= ~highMask; y &= ~highMask; }
+                    if (x != y) restDiffers = true;
+                }
+                if (restDiffers) anyRest = true; else anyAddr = true;
+            }
+            if (anyRest) { ++rest; other = true; }
+            else if (anyAddr) { ++addr; addresses = true; }
+        };
+        compareDescriptors(old.snapshot.buffers, snapshot.buffers, 0xffffu, stats.buffersAddr, stats.buffersOther, &stats.buffersShape);
+        compareDescriptors(old.snapshot.images, snapshot.images, 0xffu, stats.imagesAddr, stats.imagesOther, nullptr);
+        if (old.snapshot.samplers != snapshot.samplers) { ++stats.samplers; other = true; }
+        if (old.snapshot.flattenedSrt != snapshot.flattenedSrt) { ++stats.srt; other = true; }
+        if (old.snapshot.userData != snapshot.userData) {
+            ++stats.userData; other = true;
+            for (std::size_t i = 0; i < std::min(old.snapshot.userData.size(), snapshot.userData.size()) && i < stats.userWords.size(); ++i) {
+                if (old.snapshot.userData[i] != snapshot.userData[i]) ++stats.userWords[i];
+            }
+        }
+        if (!(old.snapshot.uniformFill == snapshot.uniformFill)) { ++stats.uniform; other = true; }
+        if (old.vertex.size() != sample.vertex.size()) { ++stats.vertexOther; other = true; }
+        else {
+            bool vAddr = false, vRest = false;
+            for (std::size_t i = 0; i < old.vertex.size(); ++i) {
+                if (old.vertex[i] == sample.vertex[i]) continue;
+                if (old.vertex[i][2] != sample.vertex[i][2] || old.vertex[i][3] != sample.vertex[i][3] || (old.vertex[i][1] & ~0xffffu) != (sample.vertex[i][1] & ~0xffffu)) vRest = true;
+                else vAddr = true;
+            }
+            if (vRest) { ++stats.vertexOther; other = true; }
+            else if (vAddr) { ++stats.vertexAddr; addresses = true; }
+        }
+        if (old.pushOffset != sample.pushOffset) { ++stats.push; other = true; }
+        if (addresses && !other) ++stats.onlyAddresses;
+    }
+    if (stats.last.size() > 65536) stats.last.clear();
+    stats.last[variantId] = std::move(sample);
+    const auto now = std::chrono::steady_clock::now();
+    if (stats.reported == std::chrono::steady_clock::time_point{}) stats.reported = now;
+    if (now - stats.reported < std::chrono::seconds(10)) return;
+    stats.reported = now;
+    std::string words;
+    for (int k = 0; k < 4; ++k) {
+        std::size_t best = 0;
+        for (std::size_t i = 1; i < stats.userWords.size(); ++i) if (stats.userWords[i] > stats.userWords[best]) best = i;
+        if (stats.userWords[best] == 0) break;
+        words += " u" + std::to_string(best) + "=" + std::to_string(stats.userWords[best]);
+        stats.userWords[best] = 0;
+    }
+    std::fprintf(stderr, "[memo-diff] %llu misses, %llu vs a previous snapshot of the variant: only addresses %llu; buffers addr %llu / other %llu / shape %llu; images addr %llu / other %llu; samplers %llu; srt %llu; user data %llu (words:%s); uniform %llu; vertex V# addr %llu / other %llu; push %llu\n",
+        (unsigned long long)stats.misses, (unsigned long long)stats.compared, (unsigned long long)stats.onlyAddresses, (unsigned long long)stats.buffersAddr, (unsigned long long)stats.buffersOther, (unsigned long long)stats.buffersShape,
+        (unsigned long long)stats.imagesAddr, (unsigned long long)stats.imagesOther, (unsigned long long)stats.samplers, (unsigned long long)stats.srt, (unsigned long long)stats.userData, words.c_str(), (unsigned long long)stats.uniform,
+        (unsigned long long)stats.vertexAddr, (unsigned long long)stats.vertexOther, (unsigned long long)stats.push);
+    stats.misses = stats.compared = stats.buffersShape = stats.buffersAddr = stats.buffersOther = stats.imagesAddr = stats.imagesOther = 0;
+    stats.samplers = stats.srt = stats.userData = stats.uniform = stats.vertexAddr = stats.vertexOther = stats.push = stats.onlyAddresses = 0;
+    stats.userWords.fill(0);
+}
+}
+
 // The memo'd result of `source`'s variant for the snapshot (design13 R5): a hit returns the shared
 // object, a miss materializes outside the source mutex and inserts (a concurrent miss's object is
 // as good). `memoHit` reports the hit.
@@ -955,6 +1065,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
             return found->second->result;
         }
     }
+    if (TraceMemoDiff()) NoteMemoMiss(variant->artifact.variantId, request, snapshot);
     const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto result = std::make_shared<RecompileResult>(materializeResult(*variant, request, snapshot));
     result->cacheHit = cacheHit;

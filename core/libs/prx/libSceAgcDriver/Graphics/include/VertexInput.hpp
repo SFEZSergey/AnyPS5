@@ -1,6 +1,8 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_VERTEXINPUT_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_VERTEXINPUT_HPP
 
+#include <atomic>
+#include <array>
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <algorithm>
 #include <cstring>
@@ -110,11 +112,21 @@ struct VertexInputLayout {
 inline VertexInputLayout BuildVertexInputLayout(const Context& context, std::span<const ShaderRecompiler::VertexAttribute> attributes) {
     Require(attributes.size() <= context.limits.maxVertexInputBindings && attributes.size() <= context.limits.maxVertexInputAttributes, "vertex input count exceeds device limits");
     VertexInputLayout result;
-    std::set<std::uint32_t> locations;
+    result.bindings.reserve(attributes.size());
+    result.attributes.reserve(attributes.size());
+    // Locations seen (a bit each; the device's attribute limit is far below 64 on every target),
+    // and the buffer features per base format, queried once per physical device.
+    std::uint64_t locations = 0;
+    struct FormatFeatures {
+        std::atomic<VkPhysicalDevice> physical{VK_NULL_HANDLE};
+        std::array<std::atomic<std::uint32_t>, 256> features{};
+    };
+    static FormatFeatures known;
     for (const auto& attribute : attributes) {
         const auto& fields = attribute.resource.fields;
         const auto format = DecodeVertexFormat(attribute);
-        Require(attribute.location < context.limits.maxVertexInputAttributes && locations.insert(attribute.location).second, "invalid or duplicate vertex attribute location");
+        Require(attribute.location < context.limits.maxVertexInputAttributes && attribute.location < 64 && (locations & (1ull << attribute.location)) == 0, "invalid or duplicate vertex attribute location");
+        locations |= 1ull << attribute.location;
         Require(attribute.fetchIndex <= 1, "unsupported vertex fetch index");
         Require((fields[1] & 0x80000000u) == 0 && (fields[3] & 0x00800000u) == 0 && (fields[3] >> 30u) == 0, "unsupported vertex buffer descriptor flags");
         const auto stride = (fields[1] >> 16u) & 0x3fffu;
@@ -123,8 +135,19 @@ inline VertexInputLayout BuildVertexInputLayout(const Context& context, std::spa
         Require(stride <= context.limits.maxVertexInputBindingStride, "vertex stride exceeds device limits");
         Require(context.formatProperties != nullptr, "missing vertex format property query");
         VkFormatProperties properties{};
-        context.formatProperties(context.physical, format.format, &properties);
-        Require((properties.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) != 0, "device does not support vertex format " + std::to_string(format.format));
+        // Cached as features + 1 (0: unknown) for the base formats; others are queried each time.
+        const auto slot = static_cast<std::size_t>(format.format);
+        if (known.physical.load(std::memory_order_acquire) != context.physical) {
+            for (auto& entry : known.features) entry.store(0, std::memory_order_relaxed);
+            known.physical.store(context.physical, std::memory_order_release);
+        }
+        if (const auto cached = slot < known.features.size() ? known.features[slot].load(std::memory_order_relaxed) : 0u; cached != 0) {
+            properties.bufferFeatures = cached - 1u;
+        } else {
+            context.formatProperties(context.physical, format.format, &properties);
+            if (slot < known.features.size()) known.features[slot].store(properties.bufferFeatures + 1u, std::memory_order_relaxed);
+        }
+        if (!((properties.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) != 0)) Fail("device does not support vertex format " + std::to_string(format.format));
         const auto binding = static_cast<std::uint32_t>(result.bindings.size());
         result.bindings.push_back({binding, stride, attribute.fetchIndex == 0 ? VK_VERTEX_INPUT_RATE_VERTEX : VK_VERTEX_INPUT_RATE_INSTANCE});
         result.attributes.push_back({attribute.location, binding, format.format, 0});

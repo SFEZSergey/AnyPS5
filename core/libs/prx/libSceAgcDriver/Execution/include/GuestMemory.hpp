@@ -34,6 +34,9 @@ bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes);
 // EqualsCommitted without the flush hook: the caller has decided that the recorded GPU work
 // writing the range need not be waited for (the dispatch-cache validation in Driver.cpp).
 bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> bytes);
+// EqualsCommitted for a snapshot known current at `generation` (a CollectWrites value): compares
+// only the blocks stamped since then.
+bool EqualsCommittedSince(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t generation);
 // EqualsCommittedUnsynced for a caller that treats an unmapped page as a miss (the dispatch-cache
 // validation's per-run compare): one walk of the page states, one memcmp per mapped run, no profile
 // counter and no reason string. Unmapped: some page of the range is not readable (or the address
@@ -59,6 +62,8 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
 // UnchangedSince is always false, so callers fall back to comparing bytes.
 bool WriteWatched();
 void Unwatch(std::uint64_t address, std::size_t bytes);
+// Unwatch from inside an ImportWatched import (the tracker lock is already held there).
+void UnwatchForImport(std::uint64_t address, std::size_t bytes);
 bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import);
 bool Watched(std::uint64_t address, std::size_t bytes);
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes);

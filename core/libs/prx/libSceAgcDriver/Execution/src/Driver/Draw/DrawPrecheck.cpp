@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include <cstdlib>
+#include <limits>
 
 namespace AgcDriver::DriverDetail {
 
@@ -13,6 +14,16 @@ bool Driver::drawPrecheck() {
 
 std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const Submission& submission, std::span<const std::uint32_t> packet, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool& traceIndirect) {
     if (!drawParameters.indirect && !drawParameters.indexed && (drawParameters.indexCount == 0 || drawParameters.instanceCount == 0)) return DrawVerdict::Nothing;
+    if (const auto resolve = Graphics::DecodeColorResolvePass(queue)) {
+        require(!drawParameters.indirect, "indirect MSAA resolves are unsupported");
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        if (device == nullptr) device = std::make_shared<VulkanDevice>();
+        const std::shared_ptr<VulkanDevice> localDevice = device;
+        recordLabelsForPacket(localDevice.get(), submission.queue);
+        localDevice->CopyBuffer(resolve->destination.address, resolve->source.address, resolve->source.bytes, 0, std::numeric_limits<std::size_t>::max(), 0, 0, submission.queue, [](std::span<const std::byte>, std::uint64_t) {});
+        return DrawVerdict::Drawn;
+    }
     if (const auto pass = Graphics::DecodeColorMetadataPass(queue)) {
         require(!drawParameters.indirect, "indirect CB metadata passes are unsupported");
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);

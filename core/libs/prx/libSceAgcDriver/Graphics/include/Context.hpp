@@ -33,6 +33,13 @@ inline void Check(VkResult result, const char* operation) {
     if (result != VK_SUCCESS) throw std::runtime_error(std::string("AGC graphics: ") + operation + ": Vulkan result " + std::to_string(result));
 }
 
+// The failure of a check whose message is built from values: callers write `if (!(cond)) Fail(...)`
+// so the message is only formatted when the check fails (Require with a built string formatted it on
+// every call, a heap allocation per attribute per draw).
+[[noreturn]] inline void Fail(const std::string& reason) {
+    throw std::runtime_error("AGC graphics: " + reason);
+}
+
 inline void Require(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(std::string("AGC graphics: ") + reason);
 }
@@ -120,6 +127,8 @@ struct Context {
     // Nonzero when VK_EXT_external_memory_host is enabled: the required host pointer alignment.
     VkDeviceSize hostImportAlignment = 0;
     bool dmaBufImport = false;
+    // VK_EXT_external_memory_host is enabled (otherwise only dma-buf imports are tried).
+    bool hostPointerImport = true;
     PFN_vkGetPhysicalDeviceMemoryProperties2 memoryProperties2 = nullptr;
     RenderCache* renderCache = nullptr;
     DrawQueue* drawQueue = nullptr;

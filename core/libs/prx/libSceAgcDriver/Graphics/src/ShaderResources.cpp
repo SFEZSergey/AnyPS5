@@ -106,6 +106,8 @@ struct CachedTexture {
     std::uint64_t sourceVersion = 0;
     std::uint64_t accounted = 0;
     std::uint64_t present = 0;
+    // Полная проверка снимка в этом кадре (APS5_TEXTURE_CHECK_PER_FRAME).
+    FrameCheck checked;
 };
 
 // Entries in use order (front = most recent) with a hash index by key: a lookup is O(1) and the
@@ -649,7 +651,10 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             const auto equalsCommitted = [&] {
                 if (Recorder::SnapshotWriteOverlaps(address, bytes)) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
-                return GuestMemory::EqualsCommitted(address, it->bytes);
+                if (FrameCheckHit(it->checked, address, it->bytes)) return true;
+                const bool equal = GuestMemory::EqualsCommittedSince(address, it->bytes, it->generation);
+                if (equal) FrameCheckNote(it->checked, address, it->bytes.size());
+                return equal;
             };
             if (*keys != DccKeys::Uncompressed || GuestMemory::UnchangedSince(address, it->bytes.size(), it->generation) || equalsCommitted()) {
                 it->generation = generation;
@@ -1327,8 +1332,8 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                     addImageBinding(binding, flags);
                     continue;
                 }
-                if (!bufferRole) Require(false, std::string("unsupported descriptor role ") + roleName(binding.role));
-                if (binding.kind != ShaderRecompiler::DescriptorKind::StorageBuffer) Require(false, std::string("unsupported descriptor kind ") + kindName(binding.kind) + " for role " + roleName(binding.role) + ": only StorageBuffer is supported");
+                if (!bufferRole) Fail(std::string("unsupported descriptor role ") + roleName(binding.role));
+                if (binding.kind != ShaderRecompiler::DescriptorKind::StorageBuffer) Fail(std::string("unsupported descriptor kind ") + kindName(binding.kind) + " for role " + roleName(binding.role) + ": only StorageBuffer is supported");
                 Require(!binding.readOnly, "read-only descriptors are unsupported because the recompiler emits no NonWritable decoration");
                 Require(binding.count != 0, "empty descriptor binding");
                 stageStorageBuffers += binding.count;
@@ -2583,12 +2588,16 @@ ResourceCache& SharedResourceCache() {
     return *cache;
 }
 
-DescriptorCache::DescriptorCache(const Context& context) : context(context), destroyLayout(context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")), destroyPool(context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")), freeSets(context.Function<PFN_vkFreeDescriptorSets>("vkFreeDescriptorSets")) {}
+DescriptorCache::DescriptorCache(const Context& context) : context(context), destroyLayout(context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")), destroyPool(context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")), freeSets(context.Function<PFN_vkFreeDescriptorSets>("vkFreeDescriptorSets")) {
+    linearPools = std::getenv("APS5_FREEABLE_DESCRIPTOR_POOLS") == nullptr;
+    if (linearPools) resetPool = context.Function<PFN_vkResetDescriptorPool>("vkResetDescriptorPool");
+}
 
 DescriptorCache::~DescriptorCache() {
     for (const auto pool : pools) destroyPool(context.device, pool, nullptr);
     for (const auto pool : updateAfterBindPools) destroyPool(context.device, pool, nullptr);
     for (const auto pool : dedicated) destroyPool(context.device, pool, nullptr);
+    for (const auto pool : linearAll) destroyPool(context.device, pool, nullptr);
     for (const auto& [key, layout] : layouts) destroyLayout(context.device, layout, nullptr);
 }
 
@@ -2623,7 +2632,7 @@ constexpr std::array<VkDescriptorPoolSize, 4> ChainPoolSizes{{{VK_DESCRIPTOR_TYP
 constexpr std::array<VkDescriptorPoolSize, 4> ChainPoolCreateSizes{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096 + 2}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 512}}};
 }
 
-DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind) {
+DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind, bool transient) {
     bool fits = true;
     for (const auto& size : sizes) {
         const auto limit = updateAfterBind && size.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ? context.descriptorIndexingLimits.maxDescriptorSetUpdateAfterBindStorageBuffers : SetDescriptorLimit(context.limits, size.type);
@@ -2651,9 +2660,51 @@ DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout l
         ++stats.sets;
         return {set, pool};
     }
+    auto& chain = updateAfterBind ? updateAfterBindPools : pools;
+    if (linearPools && transient) {
+        auto& linearChain = updateAfterBind ? linearUpdateAfterBind : linear;
+        if (linearChain.current != VK_NULL_HANDLE) {
+            allocation.descriptorPool = linearChain.current;
+            VkDescriptorSet set = VK_NULL_HANDLE;
+            const auto result = allocate(context.device, &allocation, &set);
+            if (result == VK_SUCCESS) {
+                ++live[linearChain.current].sets;
+                ++stats.sets;
+                return {set, linearChain.current};
+            }
+            if (result != VK_ERROR_OUT_OF_POOL_MEMORY && result != VK_ERROR_FRAGMENTED_POOL) Check(result, "vkAllocateDescriptorSets");
+            // The full pool drains as its sets are freed; an already empty one is reused at once.
+            if (live[linearChain.current].sets == 0) {
+                Check(resetPool(context.device, linearChain.current, 0), "vkResetDescriptorPool");
+                linearChain.spare.push_back(linearChain.current);
+            }
+            linearChain.current = VK_NULL_HANDLE;
+        }
+        VkDescriptorPool next = VK_NULL_HANDLE;
+        if (!linearChain.spare.empty()) {
+            next = linearChain.spare.back();
+            linearChain.spare.pop_back();
+        } else {
+            VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            poolInfo.flags = updateAfterBind ? VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT : 0;
+            poolInfo.maxSets = ChainPoolSets;
+            poolInfo.poolSizeCount = static_cast<std::uint32_t>(ChainPoolCreateSizes.size());
+            poolInfo.pPoolSizes = ChainPoolCreateSizes.data();
+            Check(context.Function<PFN_vkCreateDescriptorPool>("vkCreateDescriptorPool")(context.device, &poolInfo, nullptr, &next), "vkCreateDescriptorPool");
+            linearAll.push_back(next);
+            ++stats.pools;
+        }
+        linearChain.current = next;
+        live[next].updateAfterBind = updateAfterBind;
+        allocation.descriptorPool = next;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        Check(allocate(context.device, &allocation, &set), "vkAllocateDescriptorSets");
+        ++live[next].sets;
+        ++stats.sets;
+        return {set, next};
+    }
     // Newest pool first: it has the most room; a full or fragmented pool is left for its sets to
     // drain and tried again later.
-    auto& chain = updateAfterBind ? updateAfterBindPools : pools;
     for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
         allocation.descriptorPool = *it;
         VkDescriptorSet set = VK_NULL_HANDLE;
@@ -2686,6 +2737,17 @@ void DescriptorCache::Free(const SetAllocation& allocation) noexcept {
     if (const auto found = std::find(dedicated.begin(), dedicated.end(), allocation.pool); found != dedicated.end()) {
         dedicated.erase(found);
         destroyPool(context.device, allocation.pool, nullptr);
+        return;
+    }
+    if (linearPools && live.contains(allocation.pool)) {
+        // A linear pool frees nothing per set: it is reset whole once its last set is gone (and it is
+        // no longer the pool new sets come from).
+        const auto found = live.find(allocation.pool);
+        if (found == live.end() || found->second.sets == 0) return;
+        if (--found->second.sets != 0) return;
+        auto& linearChain = found->second.updateAfterBind ? linearUpdateAfterBind : linear;
+        if (allocation.pool == linearChain.current) return;
+        if (resetPool(context.device, allocation.pool, 0) == VK_SUCCESS) linearChain.spare.push_back(allocation.pool);
         return;
     }
     static_cast<void>(freeSets(context.device, allocation.pool, 1, &allocation.set));
@@ -2920,7 +2982,7 @@ void ShaderResources::addImageBinding(const ShaderRecompiler::DescriptorBinding&
     }
     const bool sampledImage = binding.kind == ShaderRecompiler::DescriptorKind::SampledImage;
     const bool samplerKind = binding.kind == ShaderRecompiler::DescriptorKind::Sampler;
-    if (!(sampledImage || samplerKind)) Require(false, std::string("unsupported descriptor kind ") + kindName(binding.kind) + " for role " + roleName(binding.role));
+    if (!(sampledImage || samplerKind)) Fail(std::string("unsupported descriptor kind ") + kindName(binding.kind) + " for role " + roleName(binding.role));
     Require((sampledImage && binding.role == ShaderRecompiler::DescriptorRole::GuestImages) || (samplerKind && binding.role == ShaderRecompiler::DescriptorRole::GuestSamplers), "guest image descriptor role disagrees with its kind");
     Require(binding.guestDescriptor.size() % binding.count == 0, "guest image descriptor size is not a multiple of the binding count");
     const auto elementWords = binding.guestDescriptor.size() / binding.count;
@@ -3339,7 +3401,15 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     if (_set == VK_NULL_HANDLE || usesBda) return {};
     const auto reads = guestMemory.InPlaceReads();
     auto result = std::make_shared<DrawBindings>();
-    std::vector<std::size_t> selected;
+    // Scratch reused across draws on this thread (cleared, never shrunk): a draw used to allocate
+    // each of these afresh. Nothing below calls back into this function.
+    thread_local std::vector<std::size_t> selected;
+    thread_local std::vector<VkDescriptorPoolSize> sizes;
+    thread_local std::vector<VkCopyDescriptorSet> copies;
+    thread_local std::vector<std::size_t> snapshotIndices;
+    thread_local std::vector<VkDescriptorBufferInfo> infos;
+    thread_local std::vector<VkWriteDescriptorSet> writes;
+    selected.clear();
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
@@ -3379,14 +3449,17 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     }
     if (selected.empty()) return {};
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
-    std::map<VkDescriptorType, std::uint32_t> counts;
-    for (const auto& binding : bindings) counts[binding.layout.descriptorType] += binding.layout.descriptorCount;
-    std::vector<VkDescriptorPoolSize> sizes;
-    for (const auto& [type, count] : counts) sizes.push_back({type, count});
+    sizes.clear();
+    for (const auto& binding : bindings) {
+        const auto found = std::find_if(sizes.begin(), sizes.end(), [&](const VkDescriptorPoolSize& size) { return size.type == binding.layout.descriptorType; });
+        if (found != sizes.end()) found->descriptorCount += binding.layout.descriptorCount;
+        else sizes.push_back({binding.layout.descriptorType, binding.layout.descriptorCount});
+    }
+    std::sort(sizes.begin(), sizes.end(), [](const VkDescriptorPoolSize& a, const VkDescriptorPoolSize& b) { return a.type < b.type; });
     result->cache = context.descriptorCache;
-    result->allocation = result->cache->Allocate(_layout, sizes);
+    result->allocation = result->cache->Allocate(_layout, sizes, false, true);
     Require(result->allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
-    std::vector<VkCopyDescriptorSet> copies;
+    copies.clear();
     for (const auto& binding : bindings) {
         VkCopyDescriptorSet copy{VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET};
         copy.srcSet = _set;
@@ -3398,13 +3471,13 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     }
     const auto update = context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets");
     update(context.device, 0, nullptr, static_cast<std::uint32_t>(copies.size()), copies.data());
-    std::vector<std::size_t> snapshotIndices(allocations.size(), selected.size());
+    snapshotIndices.assign(allocations.size(), selected.size());
     for (std::size_t index = 0; index < selected.size(); ++index) snapshotIndices[selected[index]] = index;
     std::size_t infoCount = 0;
     for (const auto& binding : bindings) infoCount += binding.allocations.size();
-    std::vector<VkDescriptorBufferInfo> infos;
+    infos.clear();
     infos.reserve(infoCount);
-    std::vector<VkWriteDescriptorSet> writes;
+    writes.clear();
     for (const auto& binding : bindings) {
         if (std::none_of(binding.allocations.begin(), binding.allocations.end(),
                 [&](std::size_t index) { return snapshotIndices[index] != selected.size(); })) continue;

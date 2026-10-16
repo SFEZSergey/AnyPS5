@@ -100,6 +100,9 @@ KernelEqueueRef EqueuePin_nid_postfix(KernelEqueue eq);
 int APS5_VABI EqueueAddEvent_nid_postfix(KernelEqueue eq, const KernelEqueueEvent& event);
 int APS5_VABI EqueueTriggerEvent_nid_postfix(KernelEqueue eq, uintptr_t ident, int16_t filter, void* triggerData);
 int APS5_VABI EqueueDeleteEvent_nid_postfix(KernelEqueue eq, uintptr_t ident, int16_t filter);
+// Ставит событие в очередь pendingEvents. Колбэки фильтров из нативной группы (Android: libc++)
+// не могут трогать std::deque x86-ядра (libstdc++) напрямую.
+void APS5_VABI EqueuePushPending_nid_postfix(KernelEqueueEvent* event, const KernelEvent* pending);
 
 }
 

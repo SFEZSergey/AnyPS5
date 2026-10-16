@@ -1,3 +1,6 @@
+#include <cstdio>
+#include <chrono>
+#include <atomic>
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -5,6 +8,34 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <cstdlib>
+
+// APS5_PROFILE_DRAW: фазы вывода кадра (мс на кадр, раз в 10 с) — сколько поток вывода держит
+// и ждёт GPU-мьютекс.
+namespace PresentPhases {
+enum Phase { Acquire, LockWait, Held, Blit, Queue, Setup, SetupHeld, Resizes, Count };
+inline std::atomic<std::uint64_t> totals[Count]{};
+inline std::atomic<std::uint64_t> frames{0};
+inline bool Enabled() {
+    static const bool enabled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return enabled;
+}
+inline void Add(Phase phase, std::chrono::steady_clock::time_point start) {
+    if (!Enabled()) return;
+    totals[phase].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+}
+inline void Report() {
+    if (!Enabled()) return;
+    static std::atomic<std::int64_t> last{0};
+    frames.fetch_add(1, std::memory_order_relaxed);
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto previous = last.load();
+    if (previous == 0) { last.compare_exchange_strong(previous, now); return; }
+    if (now - previous < 10 || !last.compare_exchange_strong(previous, now)) return;
+    const double count = static_cast<double>(std::max<std::uint64_t>(1, frames.exchange(0)));
+    const auto ms = [&](Phase phase) { return static_cast<double>(totals[phase].exchange(0)) / 1e6 / count; };
+    std::fprintf(stderr, "[present-phases] per frame: setup %.2f ms (held %.3f, resizes %.0f in 10 s), acquire %.2f ms, lock wait %.2f ms, held %.2f ms (blit %.2f, queue present %.2f)\n", ms(Setup), ms(SetupHeld), static_cast<double>(totals[Resizes].exchange(0)), ms(Acquire), ms(LockWait), ms(Held), ms(Blit), ms(Queue));
+}
+}
 
 namespace AgcDriver::DriverDetail {
 
@@ -61,19 +92,42 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         bool trailing = false;
         double waitedMs = 0;
         {
-            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
-            std::lock_guard lock(GuestMemory::GpuMutex());
-            timing.Mark("gpu_mutex_wait");
-            require(device != nullptr && device->Window() == window.context, "presentation window is not attached to the device");
-            presenting = device;
+            // The GPU mutex only guards taking the device; the drawable size is read outside it and
+            // the surface is resized under it only when something changed (the surface state is the
+            // presenter's own). Every frame used to hold the mutex here, stalling the queue worker.
+            // APS5_PRESENT_SETUP_LOCKED=1: the whole setup under the mutex, as before.
+            static const bool setupLocked = std::getenv("APS5_PRESENT_SETUP_LOCKED") != nullptr;
+            const auto setupStart = std::chrono::steady_clock::now();
+            std::unique_lock<GuestMemory::GpuMutexType> lock;
+            {
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
+                lock = std::unique_lock<GuestMemory::GpuMutexType>(GuestMemory::GpuMutex());
+                const auto heldFrom = std::chrono::steady_clock::now();
+                timing.Mark("gpu_mutex_wait");
+                require(device != nullptr && device->Window() == window.context, "presentation window is not attached to the device");
+                presenting = device;
+                if (!setupLocked) {
+                    lock.unlock();
+                    PresentPhases::Add(PresentPhases::SetupHeld, heldFrom);
+                }
+            }
             timing.Mark("device_setup");
             std::uint32_t drawableWidth = 0;
             std::uint32_t drawableHeight = 0;
             window.getDrawableSize(window.context, &drawableWidth, &drawableHeight);
-            presenting->Resize(drawableWidth, drawableHeight);
+            if (setupLocked || presenting->NeedsResize(drawableWidth, drawableHeight)) {
+                if (!lock.owns_lock()) {
+                    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
+                    lock.lock();
+                }
+                presenting->Resize(drawableWidth, drawableHeight);
+                if (PresentPhases::Enabled()) PresentPhases::totals[PresentPhases::Resizes].fetch_add(1, std::memory_order_relaxed);
+            }
+            if (lock.owns_lock()) lock.unlock();
             timing.Mark("resize");
             presentable = presenting->Presentable();
             if (buffer != nullptr) require(buffer->width == window.width && buffer->height == window.height, "display buffer extent differs from output");
+            PresentPhases::Add(PresentPhases::Setup, setupStart);
         }
 
         if (presentable && !syncFlip) {
@@ -82,19 +136,30 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
                 waitedMs = presenting->RetirePresents(presenting->PresentWaitsForSlots(buffer) ? 0 : inFlight);
                 timing.Mark("inflight_wait");
             }
+            const auto acquireStart = std::chrono::steady_clock::now();
             presentable = presenting->AcquireImage();
+            PresentPhases::Add(PresentPhases::Acquire, acquireStart);
             timing.Mark("acquire_image");
         }
         if (presentable) {
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
+            const auto lockStart = std::chrono::steady_clock::now();
             std::lock_guard lock(GuestMemory::GpuMutex());
+            PresentPhases::Add(PresentPhases::LockWait, lockStart);
+            const auto heldStart = std::chrono::steady_clock::now();
+            struct HeldScope {
+                std::chrono::steady_clock::time_point start;
+                ~HeldScope() { PresentPhases::Add(PresentPhases::Held, start); }
+            } held{heldStart};
             timing.Mark("gpu_mutex_wait");
             if (buffer != nullptr) {
                 if (syncFlip) {
                     presenting->WaitIdle();
                     timing.Mark("device_idle_wait");
                 }
+                const auto blitStart = std::chrono::steady_clock::now();
                 submitted = presenting->PresentDisplayBuffer(*buffer);
+                PresentPhases::Add(PresentPhases::Blit, blitStart);
                 timing.Mark("present_display_buffer");
             } else {
                 submitted = presenting->PresentClear(window.width, window.height, opaque);
@@ -105,8 +170,9 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
                 timing.Mark("render_fence_wait");
             }
             if (submitted && (syncFlip || inFlight != 0)) {
-
+                const auto queueStart = std::chrono::steady_clock::now();
                 presenting->QueuePresent();
+                PresentPhases::Add(PresentPhases::Queue, queueStart);
                 timing.Mark("queue_present");
                 trailing = !syncFlip;
                 submitted = false;
@@ -126,6 +192,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             timing.Mark("queue_present");
         }
         gpuReady(context);
+        PresentPhases::Report();
         timing.Mark("release_and_callback");
         if (profile) reportPresents(waitedMs, inFlight);
         CheckFailure();

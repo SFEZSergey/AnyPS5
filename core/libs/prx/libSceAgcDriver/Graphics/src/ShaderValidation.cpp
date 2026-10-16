@@ -158,11 +158,11 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
     const auto model = mesh ? spv::ExecutionModelMeshEXT : control ? spv::ExecutionModelTessellationControl : evaluation ? spv::ExecutionModelTessellationEvaluation : geometry ? spv::ExecutionModelGeometry : vertex ? spv::ExecutionModelVertex : spv::ExecutionModelFragment;
     const auto& words = shader.spirv;
 
-    Require(words.size() >= 5, "SPIR-V header is truncated: " + std::to_string(words.size()) + " words");
-    Require(words[0] == spv::MagicNumber, "invalid SPIR-V magic number: " + std::to_string(words[0]));
-    Require(words[1] >= 0x10000u && words[1] <= 0x10400u, "unsupported SPIR-V version: " + std::to_string(words[1]));
+    if (!(words.size() >= 5)) Fail("SPIR-V header is truncated: " + std::to_string(words.size()) + " words");
+    if (!(words[0] == spv::MagicNumber)) Fail("invalid SPIR-V magic number: " + std::to_string(words[0]));
+    if (!(words[1] >= 0x10000u && words[1] <= 0x10400u)) Fail("unsupported SPIR-V version: " + std::to_string(words[1]));
     Require(words[3] != 0, "invalid SPIR-V bound: 0");
-    Require(words[4] == 0, "unsupported SPIR-V schema: " + std::to_string(words[4]));
+    if (!(words[4] == 0)) Fail("unsupported SPIR-V schema: " + std::to_string(words[4]));
 
     Module module;
     std::uint32_t entries = 0;
@@ -196,8 +196,8 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
                 }
                 const bool isSubgroupCapability = subgroupOperations != 0;
                 if (isSubgroupCapability) {
-                    Require((subgroup.supportedStages & VulkanStage(stage)) != 0, "subgroup capability " + std::to_string(instruction[1]) + " is unsupported for shader stage " + std::to_string(VulkanStage(stage)));
-                    Require((subgroup.supportedOperations & subgroupOperations) == subgroupOperations, "device lacks operations for subgroup capability " + std::to_string(instruction[1]));
+                    if (!((subgroup.supportedStages & VulkanStage(stage)) != 0)) Fail("subgroup capability " + std::to_string(instruction[1]) + " is unsupported for shader stage " + std::to_string(VulkanStage(stage)));
+                    if (!((subgroup.supportedOperations & subgroupOperations) == subgroupOperations)) Fail("device lacks operations for subgroup capability " + std::to_string(instruction[1]));
                 }
 
                 const bool isBaseCapability =
@@ -257,8 +257,7 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
                      capability == spv::CapabilitySampledImageArrayNonUniformIndexing ||
                      capability == spv::CapabilityStorageImageArrayNonUniformIndexing);
 
-                Require(
-                    isBaseCapability ||
+                if (!(isBaseCapability ||
                     isBarycentricCapability ||
                     isSubgroupCapability ||
                     isBdaCapability ||
@@ -269,8 +268,7 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
                     isFeatureCapability ||
                     isDescriptorIndexingCapability ||
                     ((imageInt64Atomics || bufferInt64Atomics) && capability == spv::CapabilityInt64Atomics) ||
-                    (imageInt64Atomics && capability == spv::CapabilityInt64ImageEXT),
-                    std::string("SPIR-V requires unsupported device capability ") +
+                    (imageInt64Atomics && capability == spv::CapabilityInt64ImageEXT))) Fail(std::string("SPIR-V requires unsupported device capability ") +
                         std::to_string(static_cast<std::uint32_t>(capability)));
 
                 break;
@@ -305,9 +303,9 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
             case spv::OpMemoryModel: {
                 // Address-based shaders use PhysicalStorageBuffer64; everything else (including the
                 // generated rect-list stages) is Logical.
-                Require(count == 3, "invalid SPIR-V OpMemoryModel word count: " + std::to_string(count));
-                Require(instruction[1] == spv::AddressingModelPhysicalStorageBuffer64 || instruction[1] == spv::AddressingModelLogical, "unsupported SPIR-V addressing model: " + std::to_string(instruction[1]));
-                Require(instruction[2] == spv::MemoryModelGLSL450, "unsupported SPIR-V memory model: " + std::to_string(instruction[2]));
+                if (!(count == 3)) Fail("invalid SPIR-V OpMemoryModel word count: " + std::to_string(count));
+                if (!(instruction[1] == spv::AddressingModelPhysicalStorageBuffer64 || instruction[1] == spv::AddressingModelLogical)) Fail("unsupported SPIR-V addressing model: " + std::to_string(instruction[1]));
+                if (!(instruction[2] == spv::MemoryModelGLSL450)) Fail("unsupported SPIR-V memory model: " + std::to_string(instruction[2]));
                 ++memoryModels;
                 break;
             }
@@ -579,7 +577,7 @@ std::set<std::uint32_t> ValidateShaders(std::span<const CompiledShader> shaders,
                     for (const auto& parameter : shaders[i].program->fragmentParameters) parameters += " " + std::to_string(parameter.location) + "<-" + std::to_string(parameter.sourceLocation);
                     std::string outputs;
                     for (const auto& [index, kind] : previous.outputs) outputs += " " + std::to_string(index) + ":" + kind;
-                    Require(false, "graphics interfaces disagree at location " + std::to_string(location) +
+                    Fail("graphics interfaces disagree at location " + std::to_string(location) +
                         " (stage " + std::to_string(i - 1) + " output " +
                         (output == previous.outputs.end() ? "missing" : output->second) +
                         ", stage " + std::to_string(i) + " input " + signature + "; previous outputs:" + outputs + "; parameter exports:" + exports + "; fragment parameters:" + parameters + ")");

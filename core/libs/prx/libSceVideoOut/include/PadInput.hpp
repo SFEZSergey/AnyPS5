@@ -40,6 +40,10 @@ private:
     PadOutputState outputState{};
     bool outputPending = false;
     std::chrono::steady_clock::time_point nextRumbleRefresh{};
+    // Android touch overlay (libmain aps5_virtual_pad): merged into every publish.
+    std::uint32_t virtualSequence = 0;
+    std::uint32_t virtualButtons = 0;
+    std::array<std::uint8_t, 4> virtualSticks{128, 128, 128, 128};
 };
 
 #endif

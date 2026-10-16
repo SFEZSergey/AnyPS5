@@ -90,6 +90,9 @@ struct AudioOut2Context {
     std::deque<std::chrono::steady_clock::time_point> pendingSince;
     SDL_AudioDeviceID padDevice = 0;
     std::chrono::steady_clock::time_point nextPadProbe;
+    // Main device recovery (sceAudioOut2ContextPush): next reopen attempt after a loss.
+    std::chrono::steady_clock::time_point nextReopen;
+    bool deviceLost = false;
     AudioOut2PadLayout padLayout;
     std::vector<float> padMix;
     std::vector<float> padFrames;

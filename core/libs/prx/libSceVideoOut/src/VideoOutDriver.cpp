@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <cmath>
 #include <bit>
 #include <chrono>
 #include <cstdlib>
@@ -10,6 +12,12 @@
 
 #include "SDL.h"
 #include "SDL_vulkan.h"
+#ifdef __ANDROID__
+#include "SDL_syswm.h"
+#include <dlfcn.h>
+#define VK_USE_PLATFORM_ANDROID_KHR 1
+#include <vulkan/vulkan.h>
+#endif
 #include "prx/libSceVideoOut/include/PadInput.hpp"
 #include "prx/libSceVideoOut/include/MouseInput.hpp"
 #include "prx/libSceVideoOut/include/KeyboardInput.hpp"
@@ -33,7 +41,25 @@ void require(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(std::string("VideoOut: ") + reason);
 }
 
+#ifdef __ANDROID__
+// APK: Vulkan — системный загрузчик, открытый libadrenotools со своим драйвером Turnip (дескриптор
+// передаёт запускающая библиотека в APS5_VULKAN_HANDLE). Поверхность окна создаётся через этот же
+// загрузчик: SDL загрузила бы другой экземпляр libvulkan.
+PFN_vkGetInstanceProcAddr androidInstanceProc() {
+    static const PFN_vkGetInstanceProcAddr proc = [] {
+        const char* handle = std::getenv("APS5_VULKAN_HANDLE");
+        void* library = handle != nullptr ? reinterpret_cast<void*>(std::strtoull(handle, nullptr, 0)) : dlopen("libvulkan.so", RTLD_NOW);
+        return library != nullptr ? reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(library, "vkGetInstanceProcAddr")) : nullptr;
+    }();
+    return proc;
+}
+#endif
+
 std::vector<const char*> windowExtensions(SDL_Window* window) {
+#ifdef __ANDROID__
+    static_cast<void>(window);
+    return {"VK_KHR_surface", "VK_KHR_android_surface"};
+#endif
     unsigned extensionCount = 0;
     if (!SDL_Vulkan_GetInstanceExtensions(window, &extensionCount, nullptr)) throw std::runtime_error(std::string("SDL_Vulkan_GetInstanceExtensions failed: ") + SDL_GetError());
     std::vector<const char*> extensions(extensionCount);
@@ -44,6 +70,19 @@ std::vector<const char*> windowExtensions(SDL_Window* window) {
 
 VkSurfaceKHR createWindowSurface(void* context, VkInstance instance) {
     VkSurfaceKHR surface = VK_NULL_HANDLE;
+#ifdef __ANDROID__
+    SDL_SysWMinfo info;
+    SDL_VERSION(&info.version);
+    if (!SDL_GetWindowWMInfo(static_cast<SDL_Window*>(context), &info) || info.info.android.window == nullptr) throw std::runtime_error(std::string("SDL_GetWindowWMInfo failed: ") + SDL_GetError());
+    const auto proc = androidInstanceProc();
+    if (proc == nullptr) throw std::runtime_error("Vulkan loader for the Android surface is unavailable");
+    const auto create = reinterpret_cast<PFN_vkCreateAndroidSurfaceKHR>(proc(instance, "vkCreateAndroidSurfaceKHR"));
+    if (create == nullptr) throw std::runtime_error("vkCreateAndroidSurfaceKHR is unavailable");
+    VkAndroidSurfaceCreateInfoKHR create_info{VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR};
+    create_info.window = info.info.android.window;
+    if (create(instance, &create_info, nullptr, &surface) != VK_SUCCESS) throw std::runtime_error("vkCreateAndroidSurfaceKHR failed");
+    return surface;
+#endif
     if (!SDL_Vulkan_CreateSurface(static_cast<SDL_Window*>(context), instance, &surface)) throw std::runtime_error(std::string("SDL_Vulkan_CreateSurface failed: ") + SDL_GetError());
     return surface;
 }
@@ -473,9 +512,21 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
         require(req.ready && !req.terminal && req.generation == req.cfg->generation, "stale or incomplete flip request");
         const auto interval = static_cast<uint64_t>(req.flipRate + 1);
         require(req.cfg->lastFlipVblank <= std::numeric_limits<uint64_t>::max() - interval, "flip interval overflow");
-        const auto target = req.cfg->lastFlipVblank + interval;
+        auto target = req.cfg->lastFlipVblank + interval;
+        // APS5_FPS_LIMIT (the hub's FPS choice, against heat): flips no more often than that rate, on
+        // the 59.94 Hz vblank clock; a fractional step (45 -> 1 1/3 vblanks) alternates intervals.
+        static const double limitStep = [] {
+            const char* value = std::getenv("APS5_FPS_LIMIT");
+            const double limit = value != nullptr ? std::strtod(value, nullptr) : 0.0;
+            return limit >= 1.0 && limit < 59.0 ? 60.0 / limit : 0.0;
+        }();
+        auto& nextAllowed = req.cfg->fpsLimitNext;
+        if (limitStep > 0.0) target = std::max<uint64_t>(target, static_cast<uint64_t>(std::ceil(nextAllowed - 1e-6)));
         timing.Mark("validate");
-        req.cfg->vblankCond.wait(lock, req.cfg->shutdownToken, [&] { return req.cfg->vblankStatus.count >= target || req.cfg->failure || req.cfg->closing; });
+        // Debug aid: APS5_NO_FLIP_PACING=1 flips without waiting for the vblank (measures the
+        // unquantized frame rate).
+        static const bool noPacing = std::getenv("APS5_NO_FLIP_PACING") != nullptr;
+        if (!noPacing) req.cfg->vblankCond.wait(lock, req.cfg->shutdownToken, [&] { return req.cfg->vblankStatus.count >= target || req.cfg->failure || req.cfg->closing; });
         timing.Mark("vblank_wait");
         req.cfg->CheckAlive();
         if (req.cfg->Closed()) {
@@ -483,6 +534,11 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
             return;
         }
         req.cfg->lastFlipVblank = req.cfg->vblankStatus.count;
+        // A late flip does not bank credit: the next one waits a full step from now at most.
+        if (limitStep > 0.0) {
+            const auto flipped = static_cast<double>(req.cfg->vblankStatus.count);
+            nextAllowed = flipped >= nextAllowed + 1.0 ? flipped + limitStep - 0.5 : nextAllowed + limitStep;
+        }
     }
     require(req.width != 0 && req.height != 0 && req.width <= static_cast<uint32_t>(std::numeric_limits<int>::max()) && req.height <= static_cast<uint32_t>(std::numeric_limits<int>::max()), "invalid window dimensions");
     if (req.cfg->busType == VIDEO_OUT_BUS_TYPE_OVERLAY) {

@@ -124,6 +124,13 @@ struct ColorMetadataPass {
     std::vector<ColorTarget> targets;
 };
 std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue);
+// CB_COLOR_CONTROL in resolve mode while multisampling is ignored (APS5_IGNORE_MSAA): with one
+// sample per pixel the resolve of target 0 into target 1 is a copy of its memory.
+struct ColorResolvePass {
+    ColorTarget source;
+    ColorTarget destination;
+};
+std::optional<ColorResolvePass> DecodeColorResolvePass(const QueueState& queue);
 std::string DepthMaintenanceRejection(const QueueState& queue);
 // The message DecodeState (or the pixel stage decode after it) would throw for the register rules
 // this precheck covers, evaluated without exceptions before the draw is decoded; empty when they

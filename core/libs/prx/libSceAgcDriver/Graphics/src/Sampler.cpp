@@ -96,13 +96,13 @@ namespace AgcDriver::Graphics {
         bool filtered = false;
         for (std::uint32_t element = 0; element < 32u; ++element) {
             if (((samplerMask >> element) & 1u) == 0u) continue;
-            if (element >= samplers.size()) Require(false, "a sampled texture is paired with sampler element " + std::to_string(element) + ", which its shader does not bind");
+            if (element >= samplers.size()) Fail("a sampled texture is paired with sampler element " + std::to_string(element) + ", which its shader does not bind");
             filtered = filtered || samplers[element]->RequiresFilterMinmax();
         }
         if (!filtered) return;
         VkFormatProperties properties{};
         context.formatProperties(context.physical, format, &properties);
-        if ((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT_EXT) == 0) Require(false, "a sampled texture whose format " + std::to_string(format) + " does not support min/max filtering is sampled through a min or max reduction sampler with linear filtering");
+        if ((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT_EXT) == 0) Fail("a sampled texture whose format " + std::to_string(format) + " does not support min/max filtering is sampled through a min or max reduction sampler with linear filtering");
     }
 
     bool Sampler::ForcesDegamma() const {
@@ -115,7 +115,7 @@ namespace AgcDriver::Graphics {
 
     void RequireDegammaFormat(std::uint32_t guestFormat, std::uint32_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers) {
         for (std::uint32_t element = 0; element < 32u && element < samplers.size(); ++element) {
-            if (((samplerMask >> element) & 1u) != 0u && samplers[element]->ForcesDegamma() && !IsSrgbTextureFormat(guestFormat)) Require(false, "a texture of guest format " + std::to_string(guestFormat) + ", which is not sRGB, is sampled through a sampler that forces sRGB decoding, which is not implemented");
+            if (((samplerMask >> element) & 1u) != 0u && samplers[element]->ForcesDegamma() && !IsSrgbTextureFormat(guestFormat)) Fail("a texture of guest format " + std::to_string(guestFormat) + ", which is not sRGB, is sampled through a sampler that forces sRGB decoding, which is not implemented");
         }
     }
 
@@ -125,8 +125,8 @@ namespace AgcDriver::Graphics {
         if (bcSwizzle == BcSwizzleXyzw || bcSwizzle == BcSwizzleZyxw) return;
         for (std::uint32_t element = 0; element < 32u; ++element) {
             if (((samplerMask >> element) & 1u) == 0u) continue;
-            if (element >= samplers.size()) Require(false, "a sampled texture is paired with sampler element " + std::to_string(element) + ", which its shader does not bind");
-            if (samplers[element]->ReadsOpaqueBlackBorder()) Require(false, "a sampled texture whose BC swizzle " + std::to_string(bcSwizzle) + " moves the alpha channel is sampled through an opaque black border, which is not implemented");
+            if (element >= samplers.size()) Fail("a sampled texture is paired with sampler element " + std::to_string(element) + ", which its shader does not bind");
+            if (samplers[element]->ReadsOpaqueBlackBorder()) Fail("a sampled texture whose BC swizzle " + std::to_string(bcSwizzle) + " moves the alpha channel is sampled through an opaque black border, which is not implemented");
         }
     }
 

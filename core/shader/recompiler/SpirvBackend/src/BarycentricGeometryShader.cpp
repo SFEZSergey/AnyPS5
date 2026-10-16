@@ -1,3 +1,8 @@
+#include <memory>
+#include <tuple>
+#include <cstdlib>
+#include <mutex>
+#include <map>
 #include "Recompiler.hpp"
 #include "SpirvBackend/SpirvModule.hpp"
 #if ANYPS5_ENABLE_SPIRV_TOOLS
@@ -192,13 +197,61 @@ RecompileResult BuildBarycentricGeometryShader(const RecompileResult& vertex, co
     const auto inputComponents = 4u + 4u * static_cast<std::uint32_t>(sources.size());
     const auto fragmentComponents = 4u * (static_cast<std::uint32_t>(passed.size()) + barycentrics + 3u * static_cast<std::uint32_t>(perVertex.size()));
     require(limits->maxGeometryOutputVertices >= 3u && outputComponents <= limits->maxGeometryOutputComponents && 3u * outputComponents <= limits->maxGeometryTotalOutputComponents && inputComponents <= limits->maxGeometryInputComponents && fragmentComponents <= limits->maxFragmentInputComponents, "the emulated barycentric interface exceeds device limits");
+    // Шейдер зависит только от интерфейса вершинного и фрагментного шейдеров, а строился на каждый
+    // draw (на Turnip без VK_KHR_fragment_shader_barycentric это заметная доля кадра): запоминаем
+    // SPIR-V по ключу из всех входов эмиттера. Debug aid: APS5_NO_BARYCENTRIC_CACHE=1.
+    static const bool noCache = std::getenv("APS5_NO_BARYCENTRIC_CACHE") != nullptr;
+    std::vector<std::uint32_t> key{target.spirvVersion, layout.smoothLocation, layout.linearLocation, static_cast<std::uint32_t>(passed.size())};
+    key.insert(key.end(), passed.begin(), passed.end());
+    key.push_back(static_cast<std::uint32_t>(perVertex.size()));
+    for (const auto& parameter : perVertex) {
+        key.push_back(parameter.sourceLocation);
+        key.push_back(parameter.location);
+    }
+    key.push_back(static_cast<std::uint32_t>(layout.perVertexLocations.size()));
+    for (const auto& [from, to] : layout.perVertexLocations) {
+        key.push_back(from);
+        key.push_back(to);
+    }
+    static std::mutex cacheMutex;
+    static std::map<std::vector<std::uint32_t>, RecompileResult> cache;
+    if (!noCache) {
+        std::lock_guard lock(cacheMutex);
+        if (const auto found = cache.find(key); found != cache.end()) return found->second;
+    }
     BarycentricGeometryEmitter emitter(target.spirvVersion);
     RecompileResult result;
     result.spirv = emitter.Emit(passed, perVertex, layout);
 #if ANYPS5_ENABLE_SPIRV_TOOLS
     result.spirv = ValidateAndOptimizeSpirv(result.spirv, target.vulkanVersion, target.spirvVersion);
 #endif
+    if (!noCache) {
+        std::lock_guard lock(cacheMutex);
+        cache.emplace(std::move(key), result);
+    }
     return result;
 }
 
+
+std::shared_ptr<const RecompileResult> BuildBarycentricGeometryShaderShared(const RecompileResult& vertex, const RecompileResult& fragment, const SpirvTarget& target, const std::optional<GeometryStageLimits>& limits) {
+    static const bool noCache = std::getenv("APS5_NO_BARYCENTRIC_CACHE") != nullptr;
+    if (noCache) return std::make_shared<const RecompileResult>(BuildBarycentricGeometryShader(vertex, fragment, target, limits));
+    struct Key {
+        std::uint64_t vertex;
+        std::uint64_t fragment;
+        std::uint32_t spirv;
+        bool operator<(const Key& other) const { return std::tie(vertex, fragment, spirv) < std::tie(other.vertex, other.fragment, other.spirv); }
+    };
+    static std::mutex mutex;
+    static std::map<Key, std::shared_ptr<const RecompileResult>> shared;
+    const Key key{vertex.PipelineVariantId(), fragment.PipelineVariantId(), target.spirvVersion};
+    {
+        std::lock_guard lock(mutex);
+        if (const auto found = shared.find(key); found != shared.end()) return found->second;
+    }
+    auto result = std::make_shared<const RecompileResult>(BuildBarycentricGeometryShader(vertex, fragment, target, limits));
+    std::lock_guard lock(mutex);
+    if (shared.size() >= 8192) shared.clear();
+    return shared.emplace(key, std::move(result)).first->second;
+}
 }

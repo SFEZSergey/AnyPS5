@@ -74,7 +74,10 @@ public:
         VkDescriptorSet set = VK_NULL_HANDLE;
         VkDescriptorPool pool = VK_NULL_HANDLE;
     };
-    SetAllocation Allocate(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind = false);
+    // `transient`: a set freed once the batch using it completed (draw snapshots), taken from the
+    // linear pools; the others (sets cached with their ShaderResources, which may live long and would
+    // pin a linear pool for good) come from freeable pools.
+    SetAllocation Allocate(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind = false, bool transient = false);
     void Free(const SetAllocation& allocation) noexcept;
     // APS5_PROFILE_DRAW counters: layouts served from the map / created, sets allocated, pools opened.
     struct Stats {
@@ -97,6 +100,23 @@ private:
     std::vector<VkDescriptorPool> updateAfterBindPools;
     std::vector<VkDescriptorPool> dedicated;
     Stats stats;
+    // Linear chain pools (default; APS5_FREEABLE_DESCRIPTOR_POOLS=1 restores freeable pools): created
+    // without FREE_DESCRIPTOR_SET, so a set is a bump allocation (a freeable pool searched its free
+    // list per draw, util_vma_heap_alloc in Turnip); a pool is reset once its last set is freed.
+    struct LinearChain {
+        VkDescriptorPool current = VK_NULL_HANDLE;
+        std::vector<VkDescriptorPool> spare;
+    };
+    struct LivePool {
+        std::uint32_t sets = 0;
+        bool updateAfterBind = false;
+    };
+    bool linearPools = true;
+    PFN_vkResetDescriptorPool resetPool = nullptr;
+    LinearChain linear;
+    LinearChain linearUpdateAfterBind;
+    std::map<VkDescriptorPool, LivePool> live;
+    std::vector<VkDescriptorPool> linearAll;
 };
 
 class ShaderResources {

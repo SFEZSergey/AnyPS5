@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+extern "C" void Aps5WatchTraceSource(const char* source);
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -63,6 +64,10 @@ struct ImageMirror {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> committed;
     std::vector<std::uint64_t> generations;
     std::weak_ptr<const GuestAllocations::Range> range;
+    // The registered Range object itself: the native group adopts every lease with fresh owners over
+    // the same x86 objects, so `range` expired at each address-space rebuild and every mirror was
+    // rebuilt (its buffer copied again). A mirror whose object is in the new lease is rebound instead.
+    const GuestAllocations::Range* object = nullptr;
     std::shared_ptr<Buffer> buffer;
     // Writable ranges only: the guest bytes the mirror holds, compared on refresh and at write-back.
     std::vector<std::byte> shadow;
@@ -166,6 +171,12 @@ HostImports& Imports() {
     return imports;
 }
 
+#ifdef __ANDROID__
+// Host-pointer imports waiting to return to the write watch (see createHostPointerImport); the frame
+// hook (RewatchSettledImports) skips its scan while none is.
+std::atomic<std::uint32_t> pendingRewatches{0};
+#endif
+
 void destroyImport(const Context& context, const HostImport& entry) {
     context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, entry.buffer, nullptr);
     context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, entry.memory, nullptr);
@@ -205,6 +216,23 @@ void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, H
     // readable registered range (the import retires because its registration vanished or changed
     // size); the holder below outlives the batch that copies them.
     RetireShadow(device, it->second, [&lease](std::uint64_t begin, std::uint64_t end) { return runCovers(lease, begin, end); });
+#ifdef __ANDROID__
+    // The import took the range out of the write watch (createHostPointerImport); its pending rewatch
+    // goes with the entry, so the memory still allocated returns to the watch now. Without this every
+    // texture there stayed compared byte for byte for the rest of the run.
+    if (it->second.rewatchAtNs != 0) {
+        const auto begin = it->second.base;
+        const auto end = begin + it->second.bytes;
+        auto range = std::lower_bound(lease.begin(), lease.end(), begin, [](const auto& candidate, std::uint64_t value) { return candidate->address + candidate->bytes <= value; });
+        Aps5WatchTraceSource("drv-rewatch-retire");
+        for (; range != lease.end() && (*range)->address < end; ++range) {
+            const auto from = std::max<std::uint64_t>(begin, (*range)->address);
+            const auto to = std::min<std::uint64_t>(end, (*range)->address + (*range)->bytes);
+            if (from < to) GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<const void*>(from), static_cast<std::size_t>(to - from));
+        }
+        Aps5WatchTraceSource(nullptr);
+    }
+#endif
     auto holder = std::make_shared<RetiredImport>(state.device, state.destroyBuffer, state.freeMemory, it->second);
     if (auto* recorder = Recorder::Active(); recorder != nullptr && !recorder->Idle()) recorder->Keep(std::move(holder));
     ++state.epoch;
@@ -255,7 +283,47 @@ const char* createHostPointerImport(const Context& context, HostImport& entry, V
     }
     const VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, nullptr, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host};
     bool allocated = false;
+#ifdef __ANDROID__
+    // mprotect write watch (Android/box64): the kernel pins write-protected pages for GPU reads only
+    // (KGSL GPUREADONLY), and the GPU's stores into the import would be lost. The range leaves the
+    // watch (its pages become writable) before the import and is compared from then on; dma-buf
+    // imports (memfd pages) are not affected and stay watched.
+    GuestMemory::UnwatchForImport(entry.base, static_cast<std::size_t>(entry.bytes));
+    const char* step = bindImport(context, entry, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, &import, pointer.memoryTypeBits, allocated, failure);
+    // The import pinned the pages for GPU writes; protecting them again no longer touches that GPU
+    // mapping, so the range returns to the watch (registered fresh: written once, then tracked) and
+    // is not compared every use. APS5_COMPARE_IMPORTS=1 leaves imports compared.
+    // Rewatch only shared (memfd) memory: protecting a pinned private range again may copy its pages on
+    // the next CPU write (the GPU keeps the old ones). A shared mapping never copies. APS5_IMPORT_REWATCH=0
+    // never rewatches, =1 rewatches private memory too; APS5_COMPARE_IMPORTS=1 as =0.
+    static const char* rewatchSetting = std::getenv("APS5_IMPORT_REWATCH");
+    bool compare = std::getenv("APS5_COMPARE_IMPORTS") != nullptr || (rewatchSetting != nullptr && rewatchSetting[0] == '0');
+    if (!compare && !(rewatchSetting != nullptr && rewatchSetting[0] == '1')) {
+        int shared = -1;
+        std::uint64_t sharedOffset = 0;
+        if (GuestArena::GuestArenaSharedBacking_nid_postfix(static_cast<std::uintptr_t>(entry.base), static_cast<std::size_t>(entry.bytes), &shared, &sharedOffset)) close(shared);
+        else compare = true;
+    }
+    static const std::int64_t delayNs = [] {
+        const char* value = std::getenv("APS5_IMPORT_REWATCH_MS");
+        return (value != nullptr ? std::strtoll(value, nullptr, 10) : 3000) * 1000000ll;
+    }();
+    if (step != nullptr) {
+        // Nothing was pinned: the range goes straight back to the watch. Otherwise the dma-buf import
+        // that usually follows (memfd-backed direct memory) kept it unwatched for good, and every
+        // texture in it was compared byte for byte on every use.
+        GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<const void*>(entry.base), static_cast<std::size_t>(entry.bytes));
+        return step;
+    }
+    entry.unwatched = true;
+    if (!compare) {
+        entry.rewatchAtNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() + delayNs;
+        pendingRewatches.fetch_add(1, std::memory_order_relaxed);
+    }
+    return step;
+#else
     return bindImport(context, entry, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, &import, pointer.memoryTypeBits, allocated, failure);
+#endif
 }
 
 #ifndef _WIN32
@@ -280,6 +348,11 @@ const char* createDmaBufImport(const Context& context, HostImport& entry, int fi
     request.size = entry.bytes;
     const int device = udmabufDevice();
     const int buffer = device < 0 ? -1 : ioctl(device, UDMABUF_CREATE, &request);
+    const int createError = errno;
+    if (buffer < 0 && device >= 0) {
+        static std::atomic<int> reported{0};
+        if (reported.fetch_add(1) < 8) std::fprintf(stderr, "[gpu] UDMABUF_CREATE offset 0x%llx size 0x%llx: %s (seals 0x%x)\n", static_cast<unsigned long long>(offset), static_cast<unsigned long long>(entry.bytes), std::strerror(createError), fcntl(file, F_GET_SEALS));
+    }
     close(file);
     if (buffer < 0) {
         failure = VK_ERROR_INVALID_EXTERNAL_HANDLE;
@@ -446,7 +519,28 @@ const char* createChunkedDmaBufImport(const Context& context, HostImport& entry,
 #endif
 
 const char* createImport(const Context& context, HostImport& entry, VkResult& failure) {
-    const char* step = createHostPointerImport(context, entry, failure);
+#ifdef __ANDROID__
+    // Direct memory (memfd pages) goes through dma-buf first: those imports keep the write watch (the
+    // startup probe), while a host-pointer import of a watched range must leave the watch for good: a
+    // range protected again after it was pinned had its CPU and GPU pages diverge (guest data corrupted,
+    // crashes on level start). Host pointers serve the remaining memory, compared, never rewatched.
+    // APS5_HOST_POINTER_FIRST=1 restores the old order.
+    static const bool hostFirst = std::getenv("APS5_HOST_POINTER_FIRST") != nullptr;
+    if (!hostFirst && context.dmaBufImport) {
+        int shared = -1;
+        std::uint64_t sharedOffset = 0;
+        if (GuestArena::GuestArenaSharedBacking_nid_postfix(static_cast<std::uintptr_t>(entry.base), static_cast<std::size_t>(entry.bytes), &shared, &sharedOffset)) {
+            bool fits = false;
+            VkResult chunkFailure = VK_SUCCESS;
+            if (createChunkedDmaBufImport(context, entry, shared, sharedOffset, fits, chunkFailure) == nullptr && fits) {
+                close(shared);
+                return nullptr;
+            }
+            if (createDmaBufImport(context, entry, shared, sharedOffset, failure) == nullptr) return nullptr;
+        }
+    }
+#endif
+    const char* step = context.hostPointerImport ? createHostPointerImport(context, entry, failure) : "no host pointer import";
 #ifndef _WIN32
     int file = -1;
     std::uint64_t offset = 0;
@@ -534,7 +628,16 @@ struct ImportRun {
 };
 
 bool continuesRun(const GuestAllocations::Range& before, const GuestAllocations::Range& after) {
-    return before.address + before.bytes == after.address && before.readable && after.readable && before.writable == after.writable && before.gpu == after.gpu;
+    if (before.address + before.bytes != after.address || !before.readable || !after.readable || before.writable != after.writable || before.gpu != after.gpu) return false;
+#ifdef __ANDROID__
+    // An import of a run spanning neighbouring allocations pinned all of them (KGSL pins every page:
+    // hundreds of MiB, most of the startup), and any allocation or release next to it changed the run
+    // and re-imported the whole span. A run stays within one allocation; a buffer crossing two goes
+    // through copies. APS5_IMPORT_SPAN_ALLOCATIONS=1 spans allocations as before.
+    static const bool span = std::getenv("APS5_IMPORT_SPAN_ALLOCATIONS") != nullptr;
+    if (!span && before.allocationAddress != after.allocationAddress) return false;
+#endif
+    return true;
 }
 
 std::size_t leasedIndexContaining(const GuestAllocations::Lease& lease, std::uint64_t address) {
@@ -566,7 +669,11 @@ bool runCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::u
 bool sameRun(const HostImport& entry, const ImportRun& run) {
     if (run.base != entry.base || run.bytes != entry.bytes || run.ranges.size() != entry.ranges.size()) return false;
     for (std::size_t index = 0; index < run.ranges.size(); ++index) {
-        if (entry.ranges[index].owner_before(run.ranges[index]) || run.ranges[index].owner_before(entry.ranges[index])) return false;
+        // The registered Range objects themselves, not the owners: the native group adopts every lease
+        // with fresh owners over the same x86 objects (CoreShim adoptLease), so comparing owners failed
+        // after every registry change and re-imported (re-pinned) each allocation. The import holds its
+        // ranges, so their objects stay alive and an address names the same registration.
+        if (entry.ranges[index].get() != run.ranges[index].get()) return false;
     }
     return true;
 }
@@ -671,7 +778,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         step = createImport(context, entry, result);
         return step == nullptr;
     });
-    entry.unwatched = step == nullptr && (entry.dmaBuf ? state.unwatchDmaBufImports : state.unwatchImports);
+    entry.unwatched = step == nullptr && (entry.unwatched || (entry.dmaBuf ? state.unwatchDmaBufImports : state.unwatchImports));
 #ifdef _WIN32
     if (entry.alias != nullptr) entry.unwatched = false;
 #endif
@@ -711,7 +818,12 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
     state.liveBytes += bytes;
     if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok (%zu live, %.1f MiB live, %.1f MiB ever)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), state.imports.size() + 1, state.liveBytes / 1048576.0, importedBytes / 1048576.0);
-    return &state.imports.emplace(base, entry).first->second;
+    const auto [placed, inserted] = state.imports.emplace(base, entry);
+#ifdef __ANDROID__
+    // An entry already there keeps its own state; this import's unwatched range must not be lost.
+    if (!inserted && entry.rewatchAtNs != 0) GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<const void*>(base), static_cast<std::size_t>(bytes));
+#endif
+    return &placed->second;
 }
 
 // The lease is in address order (it is built from the registry map), so a range is found by binary search.
@@ -775,8 +887,20 @@ const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint6
     auto found = state.imports.upper_bound(begin);
     if (found == state.imports.begin()) return nullptr;
     --found;
-    const auto& entry = found->second;
-    return begin >= entry.base && end <= entry.base + entry.bytes ? &entry : nullptr;
+    auto& entry = found->second;
+    if (begin < entry.base || end > entry.base + entry.bytes) return nullptr;
+#ifdef __ANDROID__
+    // A settled host-pointer import goes back to the write watch (see createHostPointerImport). Every
+    // lookup path comes here, so no import stays compared because it is reached another way.
+    if (entry.rewatchAtNs != 0 && std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() >= entry.rewatchAtNs) {
+        entry.rewatchAtNs = 0;
+        entry.unwatched = false;
+        Aps5WatchTraceSource("drv-rewatch-find");
+        GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<const void*>(entry.base), static_cast<std::size_t>(entry.bytes));
+        Aps5WatchTraceSource(nullptr);
+    }
+#endif
+    return &entry;
 }
 
 // Whether the imports need reconciling before a lookup: the registry changed since the last walk.
@@ -887,8 +1011,22 @@ std::uint64_t heapMirrorsBeside(const GuestAllocations::Range& range) {
 
 void sweepMirrors();
 
+bool mirrorOwnerIdentity() {
+    static const bool owners = std::getenv("APS5_MIRROR_OWNER_IDENTITY") != nullptr;
+    return owners;
+}
+
 bool sameRange(const std::weak_ptr<const GuestAllocations::Range>& mirrored, const std::shared_ptr<const GuestAllocations::Range>& range) {
     return !mirrored.owner_before(range) && !range.owner_before(mirrored);
+}
+
+// The mirror serves this registered range (the same Range object); rebinds its weak owner to the
+// lease's (APS5_MIRROR_OWNER_IDENTITY=1: owners compared, as before).
+bool mirrorServes(ImageMirror& mirror, const std::shared_ptr<const GuestAllocations::Range>& range) {
+    if (mirrorOwnerIdentity()) return sameRange(mirror.range, range);
+    if (mirror.object == nullptr || mirror.object != range.get()) return false;
+    if (mirror.range.expired() || sameRange(mirror.range, range) == false) mirror.range = range;
+    return true;
 }
 
 // One 64 KiB (or shorter, at a range's ends) block of a writable mirror to compare with guest memory.
@@ -1265,7 +1403,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
         }
         if (state.failed.contains(range->address)) return nullptr;
         const auto found = state.entries.find(range->address);
-        if (found != state.entries.end() && sameRange(found->second->range, range) && found->second->reserved == range->bytes && found->second->writable == range->writable && found->second->heap == heap) mirror = found->second;
+        if (found != state.entries.end() && mirrorServes(*found->second, range) && found->second->reserved == range->bytes && found->second->writable == range->writable && found->second->heap == heap) mirror = found->second;
     }
     if (mirror != nullptr) {
         if (!mirror->sparse) {
@@ -1289,6 +1427,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
     mirror->writable = range->writable;
     mirror->heap = heap;
     mirror->range = range;
+    mirror->object = range.get();
     if (heap) {
         std::uint64_t generation = 0;
         if (sparse) {
@@ -1368,11 +1507,17 @@ void sweepMirrors() {
     ++state.sweeps;
     bool pinned = space != nullptr;
     std::size_t leased = 0;
+    std::size_t rebind = 0;
     for (auto it = state.entries.begin(); it != state.entries.end();) {
+        // An expired owner whose Range object is still in the current lease: same registration.
+        if (space != nullptr && !mirrorOwnerIdentity() && it->second->range.expired()) {
+            while (rebind < space->lease.size() && space->lease[rebind]->address < it->first) ++rebind;
+            if (rebind < space->lease.size() && space->lease[rebind]->address == it->first) mirrorServes(*it->second, space->lease[rebind]);
+        }
         if (!it->second->range.expired()) {
             if (pinned) {
                 while (leased < space->lease.size() && space->lease[leased]->address < it->first) ++leased;
-                pinned = leased < space->lease.size() && sameRange(it->second->range, space->lease[leased]);
+                pinned = leased < space->lease.size() && (mirrorOwnerIdentity() ? sameRange(it->second->range, space->lease[leased]) : it->second->object == space->lease[leased].get());
             }
             ++it;
             continue;
@@ -1889,6 +2034,34 @@ ImportWatch PrepareImportWatch(const Context& context) {
     return state.unwatchImports ? ImportWatch::Unwatch : ImportWatch::Watch;
 }
 
+void RewatchSettledImports() {
+#ifdef __ANDROID__
+    // Lookups served from caches (buffer bindings, descriptor sets) never reach findImport again, so
+    // its rewatch alone left such allocations compared byte for byte every use for good. Once a frame,
+    // every import past its delay returns to the watch here. Never waits on the imports lock.
+    static const bool disabled = std::getenv("APS5_NO_FRAME_REWATCH") != nullptr;
+    if (disabled || pendingRewatches.load(std::memory_order_relaxed) == 0) return;
+    auto& state = Imports();
+    std::unique_lock lock(state.mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return;
+    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    std::uint32_t waiting = 0;
+    for (auto& [base, entry] : state.imports) {
+        if (entry.rewatchAtNs == 0) continue;
+        if (now < entry.rewatchAtNs) {
+            ++waiting;
+            continue;
+        }
+        entry.rewatchAtNs = 0;
+        entry.unwatched = false;
+        Aps5WatchTraceSource("drv-rewatch-frame");
+        GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<const void*>(entry.base), static_cast<std::size_t>(entry.bytes));
+        Aps5WatchTraceSource(nullptr);
+    }
+    pendingRewatches.store(waiting, std::memory_order_relaxed);
+#endif
+}
+
 void SetImportWatch(const Context& context, ImportWatch watch) {
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
@@ -1905,6 +2078,15 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     // A hit is only valid while the registry has not changed since the imports were reconciled.
     if (!importsStale(context, state)) {
         if (const auto* entry = findImport(state, address, address + bytes)) return entry;
+    }
+    // An import pins the ranges it covers (entry.ranges): the guest cannot unmap, protect or replace
+    // them until the pin waiter retires the import, so a registry change elsewhere leaves a found
+    // import valid. Without this the first lookup after any guest allocation took a lease of the
+    // whole registry (on the box64 bridge: a call into x86 and an allocation per range) per draw.
+    // APS5_STRICT_IMPORTS=1 reconciles on every registry change, as before.
+    static const bool strict = std::getenv("APS5_STRICT_IMPORTS") != nullptr;
+    if (!strict && state.device == context.device) {
+        if (const auto* entry = findImport(state, address, address + bytes); entry != nullptr && !entry->ranges.empty()) return entry;
     }
     const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     refreshImports(context, state, lease);
@@ -1940,17 +2122,16 @@ bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& 
     return true;
 }
 
+// Прямой запрос к реестру, без снимка: снимок всего реестра (с закреплением каждого диапазона) на
+// один вопрос «покрыт ли адрес» стоил на мосте box64 перехода в x86 и выделения на диапазон.
 bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
-    const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
-    return containingRange(lease, address, address + bytes) != nullptr;
+    return GuestAllocations::GuestAllocationsReadableEnd_nid_postfix(address, address + bytes) != 0;
 }
 
 std::uint64_t RegisteredReadableEnd(std::uint64_t address) {
     if (address == std::numeric_limits<std::uint64_t>::max()) return 0;
-    const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
-    const auto* range = containingRange(lease, address, address + 1);
-    return range != nullptr ? range->address + range->bytes : 0;
+    return GuestAllocations::GuestAllocationsReadableEnd_nid_postfix(address, address + 1);
 }
 
 bool HostImportCovers(const Context& context, std::uint64_t address, std::size_t bytes) {

@@ -311,9 +311,45 @@ int APS5_VABI sceAudioOut2ContextGetQueueLevel(AudioOut2ContextHandle ctx, uint3
     return 0;
 }
 
+// Android stops the main stream on a route change, an audio focus loss or in the background; SDL then
+// marks the device stopped, its callback never runs again and the mix went silent for good. The stopped
+// device is closed (outside the context lock: closing waits for the callback, which takes it) and opened
+// again; a failed open is retried every second, the context pacing itself meanwhile.
+// APS5_NO_AUDIO_RECOVERY=1: off.
+static void RecoverDevice(AudioOut2Context& context) {
+    static const bool disabled = std::getenv("APS5_NO_AUDIO_RECOVERY") != nullptr;
+    if (disabled) return;
+    SDL_AudioDeviceID lost = 0;
+    {
+        std::lock_guard lock(context.lock);
+        const auto now = Clock::now();
+        if (context.device != 0) {
+            if (SDL_GetAudioDeviceStatus(context.device) != SDL_AUDIO_STOPPED) return;
+            lost = std::exchange(context.device, 0);
+            context.deviceLost = true;
+            context.nextReopen = now;
+        }
+        if (!context.deviceLost || now < context.nextReopen) return;
+        context.nextReopen = now + std::chrono::seconds(1);
+    }
+    if (lost != 0) {
+        std::fprintf(stderr, "[audioout2] device %u stopped by the system; reopening\n", static_cast<unsigned>(lost));
+        CloseDevice(lost);
+    }
+    std::lock_guard lock(context.lock);
+    context.output.clear();
+    context.pendingGrains.clear();
+    context.pendingSince.clear();
+    context.priming = true;
+    OpenDevice(context);
+    context.deviceLost = context.device == 0;
+    if (!context.deviceLost) std::fprintf(stderr, "[audioout2] device reopened as %u\n", static_cast<unsigned>(context.device));
+}
+
 int APS5_VABI sceAudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t blocking) {
     auto* context = FromHandle(ctx);
     if (!context) return SCE_AUDIO_OUT2_ERROR_INVALID_HANDLE;
+    RecoverDevice(*context);
     std::unique_lock lock(context->lock);
     auto now = Clock::now();
     const auto waitStart = now;

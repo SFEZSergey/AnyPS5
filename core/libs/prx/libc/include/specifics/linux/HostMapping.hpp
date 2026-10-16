@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <fcntl.h>
 #include <fstream>
+#include <map>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -85,9 +87,34 @@ inline std::optional<Mapping> ScanMaps(std::uint64_t address, const char* caller
     return std::nullopt;
 }
 
+// File-backed mappings (modules) found by ScanMaps: without PROCMAP_QUERY (kernels before 6.11,
+// Android) every lookup parsed all of /proc/self/maps, and the unwind queries come every frame.
+// Module mappings stay put while loaded; APS5_NO_MAPPING_CACHE=1 disables the cache.
+inline std::optional<Mapping> CachedScanMaps(std::uint64_t address, const char* caller) {
+    static const bool enabled = std::getenv("APS5_NO_MAPPING_CACHE") == nullptr;
+    if (!enabled) return ScanMaps(address, caller);
+    static std::mutex mutex;
+    static std::map<std::uint64_t, Mapping> cache;
+    {
+        std::lock_guard lock(mutex);
+        auto it = cache.upper_bound(address);
+        if (it != cache.begin()) {
+            --it;
+            if (address < it->second.end) return it->second;
+        }
+    }
+    auto found = ScanMaps(address, caller);
+    if (found && !found->path.empty()) {
+        std::lock_guard lock(mutex);
+        if (cache.size() >= 4096) cache.clear();
+        cache[found->start] = *found;
+    }
+    return found;
+}
+
 inline std::optional<Mapping> Find(std::uint64_t address, const char* caller) {
     const int fd = QueryFd();
-    if (fd < 0) return ScanMaps(address, caller);
+    if (fd < 0) return CachedScanMaps(address, caller);
     char name[4096] = {};
     procmap_query query{};
     query.size = sizeof(query);

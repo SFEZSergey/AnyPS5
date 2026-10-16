@@ -326,6 +326,10 @@ int APS5_VABI EqueueAddEvent_nid_postfix(KernelEqueue eq, const KernelEqueueEven
     return owner->AddEvent(event);
 }
 
+void APS5_VABI EqueuePushPending_nid_postfix(KernelEqueueEvent* event, const KernelEvent* pending) {
+    event->pendingEvents.push_back(*pending);
+}
+
 int APS5_VABI EqueueTriggerEvent_nid_postfix(KernelEqueue eq, uintptr_t ident, int16_t filter, void* triggerData) {
     auto owner = EqueuePin_nid_postfix(eq);
     if (!owner) {

@@ -2,9 +2,16 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libc/include/General.hpp"
+#include <cstring>
 #include <limits>
 #include <new>
 #include <stdexcept>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <cerrno>
+#include <unistd.h>
+#endif
 
 extern "C" int* APS5_VABI __error_nid_postfix();
 extern "C" int APS5_VABI sceKernelMlock_nid_postfix(void* address, std::uint64_t length);
@@ -16,7 +23,9 @@ namespace {
 constexpr int GuestInvalid = 22;
 constexpr int GuestNoMemory = 12;
 constexpr int GuestNotSupported = 45;
+constexpr int GuestShared = 0x1;
 constexpr int GuestPrivate = 0x2;
+constexpr int GuestProtWrite = 0x2;
 constexpr int GuestAnonymous = 0x1000;
 constexpr int GuestSyncAsync = 0x1;
 constexpr int GuestSyncInvalidate = 0x2;
@@ -38,6 +47,30 @@ void SetError(int error) {
     *__error_nid_postfix() = error;
 }
 
+// Reads [offset, offset + length) of a host descriptor; the tail past the end
+// of the file stays zero, as in a mapping of the file's last page.
+bool ReadAt(int descriptor, void* buffer, std::size_t length, std::int64_t offset) {
+    auto* out = static_cast<unsigned char*>(buffer);
+    while (length != 0) {
+#ifdef _WIN32
+        const auto saved = _lseeki64(descriptor, 0, SEEK_CUR);
+        if (saved < 0 || _lseeki64(descriptor, offset, SEEK_SET) < 0) return false;
+        const int chunk = length > 0x40000000u ? 0x40000000 : static_cast<int>(length);
+        const int n = _read(descriptor, out, static_cast<unsigned>(chunk));
+        _lseeki64(descriptor, saved, SEEK_SET);
+#else
+        const ssize_t n = ::pread(descriptor, out, length, offset);
+        if (n < 0 && errno == EINTR) continue;
+#endif
+        if (n < 0) return false;
+        if (n == 0) return true;
+        out += n;
+        offset += n;
+        length -= static_cast<std::size_t>(n);
+    }
+    return true;
+}
+
 bool Mapped(std::uintptr_t address) {
     VirtualQueryInfo info{};
     return sceKernelVirtualQuery(reinterpret_cast<const void*>(address), 0, &info, sizeof(info)) == 0;
@@ -55,6 +88,33 @@ void* APS5_VABI mmap_nid_postfix(void* address, std::size_t length, int protecti
     std::size_t rounded;
     if (!RoundLength(length, rounded) || (protection & ~7) != 0)
         return failed(GuestInvalid);
+    if (descriptor != -1 && (flags & GuestAnonymous) == 0) {
+        // A file mapping is served as a copy of the file: right for private
+        // mappings and for shared ones that are never written. A writable
+        // shared mapping would need its stores to reach the file.
+        const int sharing = flags & ~GuestAlignedSuper;
+        if (sharing != GuestPrivate && sharing != GuestShared) return failed(GuestNotSupported);
+        if (sharing == GuestShared && (protection & GuestProtWrite) != 0) return failed(GuestNotSupported);
+        if (offset < 0 || (offset & static_cast<std::int64_t>(PS5_PAGE_SIZE - 1)) != 0) return failed(GuestInvalid);
+        void* mapped = nullptr;
+        try {
+            if (DoMapAnon(&mapped, rounded, 3, 0, PS5_PAGE_SIZE) != 0) return failed(GuestNoMemory);
+            if (!ReadAt(descriptor, mapped, length, offset)) {
+                const int error = errno == EBADF ? 9 : GuestInvalid;
+                DoMunmap(mapped, rounded);
+                return failed(error);
+            }
+            if (protection != 3 && DoMprotect(mapped, rounded, protection) != 0) {
+                DoMunmap(mapped, rounded);
+                return failed(GuestInvalid);
+            }
+            return mapped;
+        } catch (const std::bad_alloc&) {
+            return failed(GuestNoMemory);
+        } catch (const std::exception&) {
+            return failed(GuestNoMemory);
+        }
+    }
     if ((flags & ~GuestAlignedSuper) != (GuestPrivate | GuestAnonymous))
         return failed(GuestNotSupported);
     if (descriptor != -1 || offset != 0)

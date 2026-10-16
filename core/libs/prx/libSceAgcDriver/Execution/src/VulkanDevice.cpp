@@ -1,3 +1,6 @@
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -191,9 +194,14 @@ struct VulkanDevice::State {
     VkQueue queue = VK_NULL_HANDLE;
     VkCommandPool pool = VK_NULL_HANDLE;
     void* window = nullptr;
+    // Android: окно уничтожается при сворачивании — поверхность создаётся заново при возврате.
+    VkSurfaceKHR (*createSurface)(void* context, VkInstance instance) = nullptr;
+    bool surfaceLost = false;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkExtent2D extent{};
+    // Формат swapchain: BGRA8, а на Android (там его нет) RGBA8; кадр попадает туда blit-ом с конверсией.
+    VkFormat surfaceFormat = VK_FORMAT_B8G8R8A8_UNORM;
     std::vector<VkImage> images;
     VkFence acquireFence = VK_NULL_HANDLE;
     struct RetiredSwapchain {
@@ -242,6 +250,7 @@ struct VulkanDevice::State {
     bool occlusionQueryPrecise = false;
     VkDeviceSize hostImportAlignment = 0;
     bool dmaBufImport = false;
+    bool hostPointerImport = false;
     bool memoryBudget = false;
     bool depthRangeUnrestricted = false;
     bool samplerAnisotropy = false;
@@ -651,16 +660,41 @@ struct VulkanDevice::State {
             if (surface) reinterpret_cast<PFN_vkDestroySurfaceKHR>(instanceProc(instance, "vkDestroySurfaceKHR"))(instance, surface, nullptr);
             reinterpret_cast<PFN_vkDestroyInstance>(instanceProc(instance, "vkDestroyInstance"))(instance, nullptr);
         }
+#ifdef __ANDROID__
+        // Дескриптор из APS5_VULKAN_HANDLE принадлежит запускающей библиотеке (adrenotools).
+        if (library != nullptr && std::getenv("APS5_VULKAN_HANDLE") == nullptr) {
+#else
         if (library != nullptr) {
+#endif
             SDL_UnloadObject(library);
         }
     }
 };
 
+// Android: поверхность обычно даёт только INHERIT (прозрачность задаёт окно), OPAQUE — нет.
+// Android сообщает currentExtent в естественной (портретной) ориентации дисплея и поворот в
+// currentTransform. Swapchain с IDENTITY создаётся в ориентации окна — поворачивает композитор.
+static VkExtent2D SurfaceExtent(const VkSurfaceCapabilitiesKHR& surface) {
+    constexpr VkSurfaceTransformFlagsKHR quarter = VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR | VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR |
+        VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_90_BIT_KHR | VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_ROTATE_270_BIT_KHR;
+    if ((surface.currentTransform & quarter) != 0) return {surface.currentExtent.height, surface.currentExtent.width};
+    return surface.currentExtent;
+}
+
+static VkCompositeAlphaFlagBitsKHR PickCompositeAlpha(VkCompositeAlphaFlagsKHR supported) {
+    for (const auto bit : {VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR, VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR, VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR})
+        if ((supported & bit) != 0) return bit;
+    return VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+}
+
 VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_unique<State>()), serial([] { static std::atomic<std::uint64_t> serials{0}; return serials.fetch_add(1, std::memory_order_relaxed) + 1; }()) {
     APS5_LOG_OUT("VulkanDevice constructor window=%p", static_cast<const void*>(window));
 #ifdef _WIN32
     state->library = SDL_LoadObject("vulkan-1.dll");
+#elif defined(__ANDROID__)
+    // APK: загрузчик, открытый libadrenotools со своим Turnip (см. VideoOutDriver.cpp).
+    if (const char* handle = std::getenv("APS5_VULKAN_HANDLE")) state->library = reinterpret_cast<void*>(std::strtoull(handle, nullptr, 0));
+    else state->library = SDL_LoadObject("libvulkan.so");
 #else
     state->library = SDL_LoadObject("libvulkan.so.1");
 #endif
@@ -706,6 +740,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         state->surface = window->createSurface(window->context, state->instance);
         require(state->surface != VK_NULL_HANDLE, "window returned a null surface");
         state->window = window->context;
+        state->createSurface = window->createSurface;
         APS5_LOG_OUT("Vulkan surface created surface=%p window=%p", reinterpret_cast<void*>(state->surface), state->window);
     }
     state->deviceProc = state->InstanceFunction<PFN_vkGetDeviceProcAddr>("vkGetDeviceProcAddr");
@@ -959,6 +994,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     state->drawIndirectCount = hasExtension(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
     if (state->drawIndirectCount) deviceExtensions.push_back(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
     state->memoryBudget = hasExtension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    std::fprintf(stderr, "[gpu] host import: external_memory_host=%d external_memory_fd=%d dma_buf=%d\n", hasExtension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) ? 1 : 0, hasExtension(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) ? 1 : 0, hasExtension(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME) ? 1 : 0);
     // Guest memory is host memory: importing it lets address-based shaders use it in place instead of
     // copying every registered allocation per draw.
     if (hasExtension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) && std::getenv("APS5_NO_HOST_IMPORT") == nullptr) {
@@ -975,6 +1011,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         }
 #endif
         deviceExtensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+        state->hostPointerImport = true;
 #ifndef _WIN32
         state->dmaBufImport = driverProperties.driverID != VK_DRIVER_ID_NVIDIA_PROPRIETARY && hasExtension(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) && hasExtension(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
         if (state->dmaBufImport) {
@@ -983,6 +1020,17 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         }
 #endif
     }
+#ifndef _WIN32
+    // Turnip на KGSL (Android) не даёт VK_EXT_external_memory_host, но импортирует dma-buf: общая
+    // прямая память (memfd) тогда импортируется через /dev/udmabuf без указателей хоста.
+    else if (std::getenv("APS5_NO_HOST_IMPORT") == nullptr && hasExtension(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) && hasExtension(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME)) {
+        state->hostImportAlignment = static_cast<VkDeviceSize>(sysconf(_SC_PAGESIZE));
+        state->dmaBufImport = true;
+        deviceExtensions.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+        deviceExtensions.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+        std::fprintf(stderr, "[gpu] host import through dma-buf only (no VK_EXT_external_memory_host)\n");
+    }
+#endif
     VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT listRestartFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVE_TOPOLOGY_LIST_RESTART_FEATURES_EXT};
     if (hasExtension(VK_EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_EXTENSION_NAME)) {
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &listRestartFeatures};
@@ -1339,32 +1387,41 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         APS5_LOG_OUT("Surface capabilities drawable=%ux%u min=%ux%u max=%ux%u minImages=%u maxImages=%u usage=0x%x", drawableWidth, drawableHeight, surface.minImageExtent.width, surface.minImageExtent.height, surface.maxImageExtent.width, surface.maxImageExtent.height, surface.minImageCount, surface.maxImageCount, surface.supportedUsageFlags);
         // A surface that reports its extent (a fullscreen transition can make it differ from the
         // drawable size for a moment) wins: the swapchain must match the surface.
+#ifdef __ANDROID__
+        // Android: currentExtent — размер буфера окна по умолчанию (на старте ещё портретный), а не
+        // окна; swapchain может быть любого размера — берём размер окна SDL.
+        if (false) {
+#else
         if (surface.currentExtent.width != std::numeric_limits<std::uint32_t>::max() && surface.currentExtent.width != 0 && surface.currentExtent.height != 0) {
-            drawableWidth = surface.currentExtent.width;
-            drawableHeight = surface.currentExtent.height;
+#endif
+            drawableWidth = SurfaceExtent(surface).width;
+            drawableHeight = SurfaceExtent(surface).height;
             state->extent = {drawableWidth, drawableHeight};
         }
         require(drawableWidth >= surface.minImageExtent.width && drawableWidth <= surface.maxImageExtent.width && drawableHeight >= surface.minImageExtent.height && drawableHeight <= surface.maxImageExtent.height, "unsupported output extent");
         require((surface.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT) != 0, "surface does not support transfer destination images");
-        require((surface.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) != 0, "opaque composition is unavailable");
+        require(surface.supportedCompositeAlpha != 0, "no composition mode is available");
         require((surface.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) != 0, "identity surface transform is unavailable");
         std::uint32_t formatCount = 0;
         auto getFormats = state->InstanceFunction<PFN_vkGetPhysicalDeviceSurfaceFormatsKHR>("vkGetPhysicalDeviceSurfaceFormatsKHR");
         check(getFormats(selected, state->surface, &formatCount, nullptr), "vkGetPhysicalDeviceSurfaceFormatsKHR");
         std::vector<VkSurfaceFormatKHR> formats(formatCount);
         check(getFormats(selected, state->surface, &formatCount, formats.data()), "vkGetPhysicalDeviceSurfaceFormatsKHR");
-        require(std::any_of(formats.begin(), formats.end(), [](const auto& format) { return format.format == VK_FORMAT_B8G8R8A8_UNORM && format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR; }), "BGRA8 sRGB-nonlinear surface format is unavailable");
+        const auto offered = [&](VkFormat wanted) { return std::any_of(formats.begin(), formats.end(), [wanted](const auto& format) { return format.format == wanted && format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR; }); };
+        if (offered(VK_FORMAT_B8G8R8A8_UNORM)) state->surfaceFormat = VK_FORMAT_B8G8R8A8_UNORM;
+        else if (offered(VK_FORMAT_R8G8B8A8_UNORM)) state->surfaceFormat = VK_FORMAT_R8G8B8A8_UNORM;
+        else require(false, "BGRA8/RGBA8 sRGB-nonlinear surface format is unavailable");
         VkSwapchainCreateInfoKHR swapchain{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
         swapchain.surface = state->surface;
         swapchain.minImageCount = surface.minImageCount;
-        swapchain.imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
+        swapchain.imageFormat = state->surfaceFormat;
         swapchain.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
         swapchain.imageExtent = state->extent;
         swapchain.imageArrayLayers = 1;
         swapchain.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         swapchain.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
         swapchain.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
-        swapchain.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+        swapchain.compositeAlpha = PickCompositeAlpha(surface.supportedCompositeAlpha);
         swapchain.presentMode = VK_PRESENT_MODE_FIFO_KHR;
         swapchain.clipped = VK_FALSE;
         check(state->DeviceFunction<PFN_vkCreateSwapchainKHR>("vkCreateSwapchainKHR")(state->device, &swapchain, nullptr, &state->swapchain), "vkCreateSwapchainKHR");
@@ -1388,7 +1445,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
             check(createFence(state->device, &fence, nullptr, &slot.fence), "vkCreateFence present");
             check(state->DeviceFunction<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(state->device, &allocation, &slot.commands), "vkAllocateCommandBuffers");
         }
-        state->scaler = std::make_unique<PresentationScaler>(graphicsContext(), VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM);
+        state->scaler = std::make_unique<PresentationScaler>(graphicsContext(), VK_FORMAT_B8G8R8A8_UNORM, state->surfaceFormat);
     }
 }
 
@@ -2000,21 +2057,76 @@ void* VulkanDevice::Window() const {
     return state->window;
 }
 
+bool VulkanDevice::NeedsResize(std::uint32_t width, std::uint32_t height) const {
+#ifdef __ANDROID__
+    if (width == 0 || height == 0) return state->surface != VK_NULL_HANDLE || state->extent.width != 0 || state->surfaceLost;
+    return state->surfaceLost || state->surface == VK_NULL_HANDLE || state->extent.width != width || state->extent.height != height;
+#else
+    return true;
+#endif
+}
+
 void VulkanDevice::Resize(std::uint32_t width, std::uint32_t height) {
     APS5_LOG_OUT_DEBUG("Resize requested=%ux%u current=%ux%u", width, height, state->extent.width, state->extent.height);
+#ifdef __ANDROID__
+    // Свёрнутое окно (размер 0) или потерянная поверхность: swapchain и поверхность освобождаются,
+    // при возврате окна (новый ANativeWindow) создаются заново.
+    const auto releaseSurface = [&] {
+        state->surfaceLost = false;
+        state->extent = {0, 0};
+        if (state->surface == VK_NULL_HANDLE) return;
+        WaitIdle();
+        if (state->swapchain != VK_NULL_HANDLE) {
+            state->retiredSwapchains.push_back({state->swapchain, std::move(state->rendered)});
+            state->swapchain = VK_NULL_HANDLE;
+        }
+        state->rendered.clear();
+        state->images.clear();
+        state->DestroyRetiredSwapchains();
+        state->InstanceFunction<PFN_vkDestroySurfaceKHR>("vkDestroySurfaceKHR")(state->instance, state->surface, nullptr);
+        state->surface = VK_NULL_HANDLE;
+        APS5_LOG_CHARS_OUT("Android surface released");
+    };
+    if (width == 0 || height == 0 || state->surfaceLost) {
+        releaseSurface();
+        if (width == 0 || height == 0) return;
+    }
+    if (state->surface == VK_NULL_HANDLE) {
+        try {
+            state->surface = state->createSurface(state->window, state->instance);
+        } catch (const std::exception& error) {
+            APS5_LOG_OUT("Android surface is not ready yet: %s", error.what());
+            return;
+        }
+        APS5_LOG_OUT("Android surface recreated surface=%p", reinterpret_cast<void*>(state->surface));
+    }
+#else
     require(state->swapchain != VK_NULL_HANDLE, "cannot resize an unavailable swapchain");
     if (width == 0 || height == 0) {
         state->extent = {0, 0};
         return;
     }
+#endif
     if (state->extent.width == width && state->extent.height == height) return;
     VkSurfaceCapabilitiesKHR surface{};
-    check(state->InstanceFunction<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>("vkGetPhysicalDeviceSurfaceCapabilitiesKHR")(state->physical, state->surface, &surface), "vkGetPhysicalDeviceSurfaceCapabilitiesKHR resize");
+    const VkResult capabilities = state->InstanceFunction<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>("vkGetPhysicalDeviceSurfaceCapabilitiesKHR")(state->physical, state->surface, &surface);
+#ifdef __ANDROID__
+    if (capabilities == VK_ERROR_SURFACE_LOST_KHR) {
+        releaseSurface();
+        return;
+    }
+#endif
+    check(capabilities, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR resize");
     // The window's drawable size and the surface's extent can disagree for a moment while the window
     // is being resized; the swapchain must match the surface, and the next present catches up.
+#ifdef __ANDROID__
+    if (state->extent.width == width && state->extent.height == height) return;
+    if (false) {
+#else
     if (surface.currentExtent.width != std::numeric_limits<std::uint32_t>::max()) {
-        width = surface.currentExtent.width;
-        height = surface.currentExtent.height;
+#endif
+        width = SurfaceExtent(surface).width;
+        height = SurfaceExtent(surface).height;
         if (width == 0 || height == 0) {
             WaitIdle();
             state->extent = {0, 0};
@@ -2024,18 +2136,18 @@ void VulkanDevice::Resize(std::uint32_t width, std::uint32_t height) {
     }
     WaitIdle();
     require(width >= surface.minImageExtent.width && width <= surface.maxImageExtent.width && height >= surface.minImageExtent.height && height <= surface.maxImageExtent.height, "unsupported resized output extent");
-    require((surface.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT) != 0 && (surface.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) != 0 && (surface.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) != 0, "resized surface capabilities are unsupported");
+    require((surface.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT) != 0 && surface.supportedCompositeAlpha != 0 && (surface.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) != 0, "resized surface capabilities are unsupported");
     VkSwapchainCreateInfoKHR create{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     create.surface = state->surface;
     create.minImageCount = surface.minImageCount;
-    create.imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
+    create.imageFormat = state->surfaceFormat;
     create.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     create.imageExtent = {width, height};
     create.imageArrayLayers = 1;
     create.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     create.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     create.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
-    create.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    create.compositeAlpha = PickCompositeAlpha(surface.supportedCompositeAlpha);
     create.presentMode = VK_PRESENT_MODE_FIFO_KHR;
     create.oldSwapchain = state->swapchain;
     state->retiredSwapchains.reserve(state->retiredSwapchains.size() + 1);
@@ -2220,6 +2332,8 @@ FrameDumps& Dumps() {
 }
 
 bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
+    Graphics::NotePresentedFrame();
+    Graphics::RewatchSettledImports();
     static const bool storeAtFlip = Graphics::StorageTexture::StoreAtFlipRequested(std::getenv("APS5_STORE_AT_FLIP"));
     if (storeAtFlip) Graphics::StorageTexture::FlushAllPending("flip");
     if (buffer.tilingMode == 1) {
@@ -2265,7 +2379,11 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
     const auto cleared = buffer.dccAddress != 0 && resident == nullptr ? CompressedClearPixel(buffer, bytes) : std::nullopt;
     auto& dumps = Dumps();
     bool dumpFrame = false;
-    if (dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0) {
+    // Debug aid: APS5_DUMP_TRIGGER=<file> dumps every presented frame while <file> exists (up to
+    // 400 frames), so a moment chosen at run time can be captured.
+    static const char* const dumpTrigger = std::getenv("APS5_DUMP_TRIGGER");
+    const bool triggered = dumpTrigger != nullptr && dumps.dumped < 400 && access(dumpTrigger, F_OK) == 0;
+    if (triggered || (dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0)) {
         if (dumps.cpu) {
             auto full = cleared ? std::vector<std::byte>(static_cast<std::size_t>(buffer.width) * buffer.height * cleared->size()) : ReadDisplayBuffer(buffer);
             for (std::size_t offset = 0; cleared && offset < full.size(); offset += cleared->size()) std::memcpy(full.data() + offset, cleared->data(), cleared->size());
@@ -2307,7 +2425,8 @@ bool VulkanDevice::AcquireImage() {
     timing.Mark("fence_reset");
     // An out-of-date swapchain (the window changed) drops this frame; the next Resize recreates it.
     const auto acquired = state->DeviceFunction<PFN_vkAcquireNextImageKHR>("vkAcquireNextImageKHR")(state->device, state->swapchain, 5'000'000'000ULL, VK_NULL_HANDLE, state->acquireFence, &index);
-    if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {
+    if (acquired == VK_ERROR_OUT_OF_DATE_KHR || acquired == VK_ERROR_SURFACE_LOST_KHR) {
+        state->surfaceLost = acquired == VK_ERROR_SURFACE_LOST_KHR;
         state->extent = {0, 0};
         return false;
     }
@@ -2623,7 +2742,22 @@ void VulkanDevice::QueuePresent() {
     present.pSwapchains = &state->swapchain;
     present.pImageIndices = &index;
     const auto presented = state->DeviceFunction<PFN_vkQueuePresentKHR>("vkQueuePresentKHR")(state->queue, &present);
-    if (presented == VK_ERROR_OUT_OF_DATE_KHR || presented == VK_SUBOPTIMAL_KHR) state->extent = {0, 0};
+#ifdef __ANDROID__
+    // Android reports SUBOPTIMAL on every present of an identity-transform swapchain on a rotated
+    // (landscape) display: the compositor rotates it, the image is right. Recreating for it cost a
+    // device-wide WaitIdle and a new swapchain every frame under the GPU mutex.
+    // APS5_RECREATE_ON_SUBOPTIMAL=1: recreate as before.
+    static const bool recreateSuboptimal = std::getenv("APS5_RECREATE_ON_SUBOPTIMAL") != nullptr;
+#else
+    constexpr bool recreateSuboptimal = true;
+#endif
+    if (presented == VK_ERROR_OUT_OF_DATE_KHR || (presented == VK_SUBOPTIMAL_KHR && recreateSuboptimal)) state->extent = {0, 0};
+    else if (presented == VK_SUBOPTIMAL_KHR) {
+    }
+    else if (presented == VK_ERROR_SURFACE_LOST_KHR) {
+        state->surfaceLost = true;
+        state->extent = {0, 0};
+    }
     else check(presented, "vkQueuePresentKHR");
     timing.Mark("queue_present");
     APS5_LOG_OUT_DEBUG("vkQueuePresentKHR queued imageIndex=%u", index);
@@ -2731,6 +2865,7 @@ Graphics::Context VulkanDevice::buildContext() const {
         state->hostImportAlignment
     };
     context.dmaBufImport = state->dmaBufImport;
+    context.hostPointerImport = state->hostPointerImport;
     context.recorder = state->recorder.get();
     context.descriptorCache = state->descriptorCache.get();
     context.samplerCache = state->samplerCache.get();

@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 #include "prx/libkernel/File/include/FileFlags.hpp"
 #include "prx/libkernel/File/include/NativeStat.hpp"
 #include "prx/libc/include/General.hpp"
@@ -117,6 +119,8 @@ static int SceErrorFromErrno(int error) {
     return static_cast<int>(0x80020000u | static_cast<unsigned>(guest));
 }
 
+static bool TraceFileIo() { static const bool on = std::getenv("APS5_TRACE_FILEIO") != nullptr; return on; }
+
 extern "C" {
 
 int APS5_VABI sceKernelOpen(const char* path, int flags, std::uint16_t mode) {
@@ -150,10 +154,12 @@ int APS5_VABI sceKernelOpen(const char* path, int flags, std::uint16_t mode) {
     }
     if ((flags & SCE_KERNEL_O_ACCMODE) != SCE_KERNEL_O_RDONLY || (flags & (SCE_KERNEL_O_CREAT | SCE_KERNEL_O_TRUNC)))
         RecordWrittenPath_nid_no_patch(native);
+    if (TraceFileIo()) std::fprintf(stderr, "[fileio] open %s -> fd %d\n", path, fd);
     return fd;
 }
 
 int APS5_VABI sceKernelClose(int d) {
+    if (TraceFileIo()) std::fprintf(stderr, "[fileio] close fd %d\n", d);
     File::ForgetRandomDevice(d);
 #ifdef _WIN32
     File::ForgetDirectoryDescriptor(d);
@@ -181,6 +187,7 @@ std::int64_t APS5_VABI sceKernelRead(int d, void* buf, std::size_t nbytes) {
     if (n < 0) {
         throw std::runtime_error(std::string(__func__) + ": read failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));
     }
+    if (TraceFileIo()) std::fprintf(stderr, "[fileio] read fd %d want %zu -> %lld\n", d, nbytes, static_cast<long long>(n));
     return static_cast<std::int64_t>(n);
 }
 
@@ -207,6 +214,7 @@ std::int64_t APS5_VABI sceKernelLseek(int d, std::int64_t offset, int whence) {
     if (result < 0) {
         throw std::runtime_error(std::string(__func__) + ": lseek failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));
     }
+    if (TraceFileIo()) std::fprintf(stderr, "[fileio] lseek fd %d off %lld whence %d -> %lld\n", d, static_cast<long long>(offset), whence, static_cast<long long>(result));
     return result;
 }
 
@@ -233,6 +241,7 @@ int APS5_VABI sceKernelStat(const char* path, FileStat* sb) {
     const std::string_view guestPath(path);
     if (!guestPath.empty() && guestPath.back() == '/' && !std::filesystem::is_directory(status)) return SceErrorFromErrno(GuestEnotdir);
     File::FillFileStat(native, sb);
+    if (TraceFileIo()) std::fprintf(stderr, "[fileio] stat %s\n", path);
     return 0;
 }
 

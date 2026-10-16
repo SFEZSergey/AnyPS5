@@ -16,7 +16,11 @@ target_include_directories(libSceVideoOut PRIVATE
         ${CMAKE_SOURCE_DIR}/3rdparty/SDL2/include
         ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include
 )
-target_link_libraries(libSceVideoOut PRIVATE libSceAgcDriver libScePad libSceMouse libSceKeyboard libc libkernel decoder_png SDL2-static)
+if(APS5_NATIVE_GROUP)
+    target_link_libraries(libSceVideoOut PRIVATE libSceAgcDriver libScePad libSceMouse libSceKeyboard aps5coreshim decoder_png SDL2-static)
+else()
+    target_link_libraries(libSceVideoOut PRIVATE libSceAgcDriver libScePad libSceMouse libSceKeyboard libc libkernel decoder_png SDL2-static)
+endif()
 if(WIN32)
     target_link_libraries(libSceVideoOut PRIVATE comctl32)
 endif()

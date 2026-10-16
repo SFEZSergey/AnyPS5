@@ -23,6 +23,25 @@ namespace AgcDriver::Graphics {
 class ResidentColor;
 class CommandBatch;
 class StorageTexture;
+
+// Номер показанного кадра (растёт на каждом PresentDisplayBuffer); для проверок текстур раз в кадр.
+void NotePresentedFrame();
+std::uint64_t PresentedFrame();
+
+// APS5_TEXTURE_CHECK_PER_FRAME (без отслеживания записей): полное сравнение снимка с памятью
+// гостя раз в кадр, в остальных проверках кадра — выборкой и по признакам записей GPU/драйвера.
+// Полное сравнение — раз в APS5_TEXTURE_FULL_CHECK_FRAMES кадров (по умолчанию 30), в остальные кадры
+// при первом использовании выборочное, дальше в том же кадре — без сравнения.
+struct FrameCheck {
+    std::uint64_t frame = ~0ull;      // кадр, в котором снимок подтверждён
+    std::uint64_t fullFrame = ~0ull;  // кадр последнего полного сравнения
+    std::array<std::uint64_t, 3> stamp{};
+};
+bool TextureCheckPerFrame();
+// Совпадает ли память со снимком без полного сравнения (true — полное сравнение не нужно).
+bool FrameCheckHit(FrameCheck& check, std::uint64_t address, std::span<const std::byte> saved);
+// Отмечает полное совпадение снимка с памятью в этом кадре.
+void FrameCheckNote(FrameCheck& check, std::uint64_t address, std::size_t bytes);
 struct HostImport;
 
 // The Vulkan format storage images of a guest format use (sRGB formats store as their UNORM form).
@@ -470,6 +489,8 @@ private:
     SurfaceGeometry geometry;
     std::vector<std::byte> original;
     mutable std::array<std::uint64_t, 4> comparedGuestBytes{};
+    // APS5_TEXTURE_CHECK_PER_FRAME: кадр и признаки последнего полного сравнения, совпавшего со снимком.
+    mutable FrameCheck comparedFrame;
     std::vector<std::byte> generationBaseline;
     // DCC keys the image content was uploaded under: a fast-cleared surface starts as its clear value.
     DccKeys uploadedKeys = DccKeys::Uncompressed;

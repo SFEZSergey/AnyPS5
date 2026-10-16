@@ -2,6 +2,12 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
 #include <cstdlib>
+#ifdef __ANDROID__
+#include <cerrno>
+#include <cstdio>
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
 
 namespace AgcDriver::DriverDetail {
 
@@ -20,6 +26,19 @@ std::uint64_t WorkerAffinityMask() {
 }
 
 void PinWorkerThread(const char* role) {
+#ifdef __ANDROID__
+    // The queue workers and the presenter are the frame's critical path; at the default priority the
+    // game's own threads preempted them (a presenter preempted under the GPU mutex stalled the queue
+    // worker behind it). Display priority, as Android games use (RLIMIT_NICE allows it).
+    // APS5_WORKER_NICE sets the value (0: unchanged).
+    static const int nice = [] {
+        const char* value = std::getenv("APS5_WORKER_NICE");
+        return value != nullptr ? std::atoi(value) : -8;
+    }();
+    if (nice != 0 && setpriority(PRIO_PROCESS, static_cast<id_t>(gettid()), nice) != 0) {
+        std::fprintf(stderr, "[affinity] %s: priority %d refused (errno %d)\n", role, nice, errno);
+    }
+#endif
     const auto mask = WorkerAffinityMask();
     if (mask == 0) return;
     static std::once_flag summary;

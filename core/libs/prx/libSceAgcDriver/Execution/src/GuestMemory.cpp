@@ -1,3 +1,6 @@
+#if !defined(_WIN32)
+#include <dlfcn.h>
+#endif
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
@@ -5,13 +8,19 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+
+// Нативное отслеживание записи (coreshim): диагностика APS5_TRACE_SINCE.
+extern "C" void Aps5WatchInterval(std::uintptr_t address, std::uintptr_t* begin, std::uintptr_t* end);
+extern "C" void Aps5WatchTraceSource(const char* source);
 #include <mutex>
 #include <array>
 #include <chrono>
 #include <atomic>
 #include <algorithm>
 #include <bit>
+#if defined(__x86_64__) || defined(_M_X64)
 #include <emmintrin.h>
+#endif
 #include <functional>
 #include <cstdio>
 #include <cstdlib>
@@ -81,6 +90,9 @@ unsigned long long ModuleOffset(const void* address) {
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCSTR>(address), &module);
     return reinterpret_cast<std::uintptr_t>(address) - reinterpret_cast<std::uintptr_t>(module);
 #else
+    // Смещение от базы модуля, чтобы адреса символизировались через nm/addr2line по .prx.
+    Dl_info info{};
+    if (dladdr(address, &info) != 0 && info.dli_fbase != nullptr) return reinterpret_cast<std::uintptr_t>(address) - reinterpret_cast<std::uintptr_t>(info.dli_fbase);
     return reinterpret_cast<std::uintptr_t>(address);
 #endif
 }
@@ -403,7 +415,7 @@ struct PageSpan {
     }
 
     std::uint8_t load(std::uintptr_t address) const {
-        return std::atomic_ref<const std::uint8_t>(pages[(address - base) / PageBytes]).load(std::memory_order_relaxed);
+        return std::atomic_ref<std::uint8_t>(pages[(address - base) / PageBytes]).load(std::memory_order_relaxed);
     }
 
     void store(std::uintptr_t address, std::uint8_t value) {
@@ -416,11 +428,11 @@ struct PageSpan {
         const auto stop = std::min<std::uintptr_t>((std::min(limit, base + size) - base + PageBytes - 1) / PageBytes, size / PageBytes);
         const std::uint64_t wide = 0x0101010101010101ull * value;
         while (index < stop) {
-            if (index % 8 == 0 && index + 8 <= stop && std::atomic_ref<const std::uint64_t>(*reinterpret_cast<const std::uint64_t*>(pages + index)).load(std::memory_order_relaxed) == wide) {
+            if (index % 8 == 0 && index + 8 <= stop && std::atomic_ref<std::uint64_t>(*reinterpret_cast<std::uint64_t*>(pages + index)).load(std::memory_order_relaxed) == wide) {
                 index += 8;
                 continue;
             }
-            if (std::atomic_ref<const std::uint8_t>(pages[index]).load(std::memory_order_relaxed) != value) break;
+            if (std::atomic_ref<std::uint8_t>(pages[index]).load(std::memory_order_relaxed) != value) break;
             ++index;
         }
         return std::min(limit, base + index * PageBytes);
@@ -614,6 +626,21 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
             }
             return false;
         }
+        // Без PROCMAP_QUERY (ядра до 6.11, Android) каждый запрос перечитывает весь /proc/self/maps,
+        // а под Box64 он ещё и генерируется заново; поэтому найденные доступные области запоминаем
+        // в таблице страниц, как ветка Windows, и снимаем их при смене поколения.
+        const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        const auto remember = [&](std::uintptr_t first, std::uintptr_t last, bool readable, bool writable) {
+            if (!readable) return;
+            for (PageSpan* span : {&pages.arena, &pages.image}) {
+                if (span->size == 0 || last <= span->base || first >= span->base + span->size) continue;
+                const std::uint8_t value = PageReadable | (writable ? PageWritable : 0u);
+                const auto from = std::max(first, span->base) & ~(PageBytes - 1);
+                const auto to = std::min(last, span->base + span->size);
+                for (auto at = from; at < to; at += PageBytes) span->store(at, value);
+                if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() != generation) span->forget(from, static_cast<std::size_t>(to - from));
+            }
+        };
         std::ifstream maps("/proc/self/maps");
         if (!maps.is_open()) return false;
         std::string line;
@@ -624,7 +651,8 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
             std::uintptr_t last = 0;
             char separator = 0;
             std::string permissions;
-            if (!(fields >> std::hex >> first >> separator >> last >> permissions) || separator != '-' || first >= last || permissions.size() < 2) return false;
+            if (!(fields >> std::hex >> first >> separator >> last >> permissions) || separator != '-' || first > last || permissions.size() < 2) return false;
+            if (first == last) continue; // Android: пустые записи
             if (last <= cursor) continue;
             if (first > cursor) {
                 const auto gapEnd = std::min(end, first);
@@ -633,6 +661,7 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
                 found = true;
                 break;
             }
+            remember(first, last, permissions[0] == 'r', permissions[0] == 'r' && permissions[1] == 'w');
             const auto next = std::min(end, last);
             if (!emit(PageRun{cursor, next, permissions[0] == 'r', permissions[0] == 'r' && permissions[1] == 'w'})) return true;
             cursor = next;
@@ -1183,12 +1212,16 @@ std::uint64_t CollectEpoch() {
 
 namespace {
 
+bool importTrackerActive();
+
 void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t bytes) {
     if (!tracker.watched) return;
 #ifdef _WIN32
     if (tracker.coverage.Exclude(address, bytes, GuestArena::GuestArenaCommitGeneration_nid_postfix())) unwatchSerial.fetch_add(1, std::memory_order_release);
 #else
+    Aps5WatchTraceSource(importTrackerActive() ? "drv-import-unwatch" : "drv-unwatch");
     if (GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<const void*>(address), bytes)) unwatchSerial.fetch_add(1, std::memory_order_release);
+    Aps5WatchTraceSource(nullptr);
 #endif
 }
 
@@ -1200,6 +1233,18 @@ void Unwatch(std::uint64_t address, std::size_t bytes) {
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     unwatchLocked(tracker, address, bytes);
+}
+
+namespace {
+// The tracker an ImportWatched import on this thread runs under (its lock held), for UnwatchForImport.
+thread_local WriteTracker* importTracker = nullptr;
+bool importTrackerActive() { return importTracker != nullptr; }
+}
+
+void UnwatchForImport(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return;
+    if (importTracker != nullptr) unwatchLocked(*importTracker, address, bytes);
+    else Unwatch(address, bytes);
 }
 
 bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import) {
@@ -1216,7 +1261,16 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     const auto stop = (address + bytes + page - 1) & ~(page - 1);
     const bool covered = tracker.covers(first, static_cast<std::size_t>(stop - first));
     const bool before = covered && walkWrites(tracker, first, stop, StampKind::Cpu, true);
-    if (!import()) return false;
+    struct ImportScope {
+        explicit ImportScope(WriteTracker& tracker) { importTracker = &tracker; }
+        ~ImportScope() { importTracker = nullptr; }
+    };
+    bool imported = false;
+    {
+        const ImportScope scope(tracker);
+        imported = import();
+    }
+    if (!imported) return false;
     if (!before || !walkWrites(tracker, first, stop, StampKind::ImportWindow, true)) unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
     return true;
 }
@@ -1829,6 +1883,119 @@ bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> b
     return true;
 }
 
+
+namespace {
+// APS5_TRACE_SINCE=1: every 10 s, [since] calls, bytes asked and compared, and why the whole range
+// was compared (no generation, collect unavailable, range not watched/covered).
+struct SinceStats {
+    std::atomic<std::uint64_t> calls{0}, asked{0}, compared{0}, noGeneration{0}, noCollect{0}, uncovered{0}, partial{0}, last{0}, nogenCovered{0}, nogenUnwatched{0};
+    std::array<std::atomic<std::uint64_t>, 6> samples{};
+    std::array<std::atomic<std::uint64_t>, 6> sampleBytes{};
+    std::atomic<std::uint32_t> nextSample{0};
+};
+SinceStats& Since() {
+    static SinceStats& stats = *new SinceStats();
+    return stats;
+}
+bool TraceSince() {
+    static const bool enabled = std::getenv("APS5_TRACE_SINCE") != nullptr;
+    return enabled;
+}
+void ReportSince() {
+    auto& stats = Since();
+    const auto now = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    auto last = stats.last.load(std::memory_order_relaxed);
+    if (last == 0) { stats.last.store(now, std::memory_order_relaxed); return; }
+    if (now - last < 10 || !stats.last.compare_exchange_strong(last, now)) return;
+    std::fprintf(stderr, "[since] calls=%llu askedMB=%.1f comparedMB=%.1f nogen=%llu nocollect=%llu uncovered=%llu partial=%llu\n",
+        static_cast<unsigned long long>(stats.calls.exchange(0)), stats.asked.exchange(0) / 1048576.0, stats.compared.exchange(0) / 1048576.0,
+        static_cast<unsigned long long>(stats.noGeneration.exchange(0)), static_cast<unsigned long long>(stats.noCollect.exchange(0)),
+        static_cast<unsigned long long>(stats.uncovered.exchange(0)), static_cast<unsigned long long>(stats.partial.exchange(0)));
+    std::fprintf(stderr, "[since] nogen: covered=%llu unwatched-tracker=%llu samples:", static_cast<unsigned long long>(stats.nogenCovered.exchange(0)), static_cast<unsigned long long>(stats.nogenUnwatched.exchange(0)));
+    for (std::size_t i = 0; i < stats.samples.size(); ++i) {
+        const auto at = stats.samples[i].exchange(0);
+        const auto size = stats.sampleBytes[i].exchange(0);
+        std::uintptr_t b0 = 0, e0 = 0, b1 = 0, e1 = 0;
+        if (at != 0) {
+            Aps5WatchInterval(at, &b0, &e0);
+            Aps5WatchInterval(at + size - 1, &b1, &e1);
+        }
+        std::fprintf(stderr, " 0x%llx+0x%llx[head 0x%llx-0x%llx tail 0x%llx-0x%llx]", static_cast<unsigned long long>(at), static_cast<unsigned long long>(size), static_cast<unsigned long long>(b0), static_cast<unsigned long long>(e0), static_cast<unsigned long long>(b1), static_cast<unsigned long long>(e1));
+    }
+    std::fprintf(stderr, "\n");
+    stats.nextSample.store(0);
+}
+}
+
+bool EqualsCommittedSince(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t generation) {
+    if (bytes.empty()) return true;
+    const bool trace = TraceSince();
+    if (trace) {
+        ReportSince();
+        Since().calls.fetch_add(1, std::memory_order_relaxed);
+        Since().asked.fetch_add(bytes.size(), std::memory_order_relaxed);
+    }
+    // The 64 KiB blocks nobody stamped since `generation` still hold what the snapshot held then
+    // (the UnchangedSince rule); only the stamped ones are compared (KytyPS5 compares written pages
+    // alone too). APS5_FULL_COMPARE=1 compares every byte, as before.
+    static const bool full = std::getenv("APS5_FULL_COMPARE") != nullptr;
+    if (full || generation == 0) {
+        if (trace) {
+            auto& stats = Since();
+            stats.noGeneration.fetch_add(1, std::memory_order_relaxed);
+            stats.compared.fetch_add(bytes.size(), std::memory_order_relaxed);
+            if (!WriteWatched()) stats.nogenUnwatched.fetch_add(1, std::memory_order_relaxed);
+            else if (Watched(address, bytes.size())) stats.nogenCovered.fetch_add(1, std::memory_order_relaxed);
+            const auto slot = stats.nextSample.fetch_add(1, std::memory_order_relaxed);
+            if (slot < stats.samples.size() && slot % 1 == 0) {
+                stats.samples[slot].store(address, std::memory_order_relaxed);
+                stats.sampleBytes[slot].store(bytes.size(), std::memory_order_relaxed);
+            }
+        }
+        return EqualsCommitted(address, bytes);
+    }
+    FlushGpuWrites(address, bytes.size());
+    // Stores the flush made (and any since the caller's collect) are stamped by a fresh collect.
+    if (CollectWritesUncached(address, bytes.size()) == 0) {
+        if (trace) {
+            Since().noCollect.fetch_add(1, std::memory_order_relaxed);
+            Since().compared.fetch_add(bytes.size(), std::memory_order_relaxed);
+        }
+        return EqualsCommittedUnsynced(address, bytes);
+    }
+    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+    runs.clear();
+    const auto end = address + bytes.size();
+    {
+        auto& tracker = Tracker();
+        const auto lock = lockTracker(tracker);
+        tracker.initialize();
+        if (!tracker.watched || !tracker.covers(address, bytes.size())) {
+            if (trace) Since().uncovered.fetch_add(1, std::memory_order_relaxed);
+            runs.emplace_back(address, end);
+        } else {
+            const auto last = tracker.blockOf(end - 1);
+            for (auto block = tracker.blockOf(address); block <= last; ++block) {
+                if (tracker.stampOf(block) <= generation) continue;
+                const auto from = std::max(address, tracker.blockBegin(block));
+                const auto to = std::min<std::uint64_t>(end, tracker.blockBegin(block) + WriteBlockBytes);
+                if (!runs.empty() && runs.back().second == from) runs.back().second = to;
+                else runs.emplace_back(from, to);
+            }
+        }
+    }
+    if (trace) {
+        std::uint64_t total = 0;
+        for (const auto& [from, to] : runs) total += to - from;
+        Since().compared.fetch_add(total, std::memory_order_relaxed);
+        if (total != 0 && total < bytes.size()) Since().partial.fetch_add(1, std::memory_order_relaxed);
+    }
+    for (const auto& [from, to] : runs) {
+        if (!EqualsCommittedUnsynced(from, bytes.subspan(static_cast<std::size_t>(from - address), static_cast<std::size_t>(to - from)))) return false;
+    }
+    return true;
+}
+
 Compare CompareMapped(std::uint64_t address, std::span<const std::byte> bytes) {
     if (bytes.empty()) return Compare::Equal;
     if (address == 0 || bytes.size() > std::numeric_limits<std::uintptr_t>::max() - address) return Compare::Unmapped;
@@ -1883,6 +2050,7 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
         std::size_t firstChanged = size;
         std::size_t lastChanged = 0;
         std::size_t at = 0;
+#if defined(__x86_64__) || defined(_M_X64)
         for (; at + 16 <= size; at += 16) {
             const auto bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(current.data() + at));
             const auto same = _mm_cmpeq_epi8(bytes, _mm_loadu_si128(reinterpret_cast<const __m128i*>(original.data() + at)));
@@ -1895,6 +2063,20 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
             lastChanged = std::max(lastChanged, at + 32 - static_cast<std::size_t>(std::countl_zero(changed)));
         }
         _mm_sfence();
+#else
+        // Без SSE: блоки по 16 байт, в отличающемся блоке пишутся только изменённые байты (как
+        // маскированная запись выше).
+        for (; at + 16 <= size; at += 16) {
+            if (std::memcmp(current.data() + at, original.data() + at, 16) == 0) continue;
+            for (std::size_t i = at; i < at + 16; ++i) {
+                if (current[i] == original[i]) continue;
+                destination[i] = current[i];
+                firstChanged = std::min(firstChanged, i);
+                lastChanged = std::max(lastChanged, i + 1);
+            }
+        }
+        std::atomic_thread_fence(std::memory_order_release);
+#endif
         for (; at < size; ++at) {
             if (current[at] == original[at]) continue;
             destination[at] = current[at];

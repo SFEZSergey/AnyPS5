@@ -533,6 +533,9 @@ struct GeometryStageLimits {
 };
 
 [[nodiscard]] RecompileResult BuildBarycentricGeometryShader(const RecompileResult& vertex, const RecompileResult& fragment, const SpirvTarget& target, const std::optional<GeometryStageLimits>& limits);
+// The same shader, shared and memoized per (vertex, fragment) pipeline variant: the variants fix every
+// input of the emitter, so a draw pays a map lookup instead of the layout and a result copy.
+[[nodiscard]] std::shared_ptr<const RecompileResult> BuildBarycentricGeometryShaderShared(const RecompileResult& vertex, const RecompileResult& fragment, const SpirvTarget& target, const std::optional<GeometryStageLimits>& limits);
 
 }
 

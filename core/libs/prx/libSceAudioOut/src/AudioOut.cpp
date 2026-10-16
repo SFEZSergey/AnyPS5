@@ -29,7 +29,13 @@ static constexpr int PORTS_MAX = 32;
 static constexpr int DEFAULT_VOLUME = 32768;
 static constexpr int DEFAULT_PADSPK_MIX_LEVEL = 11626;
 static constexpr std::uint32_t FORMAT_MASK = 0xFFu;
-static constexpr std::uint64_t TARGET_LATENCY_US = 40000;
+// Queued audio ahead of playback. 40 ms ran dry whenever a frame of the game took longer (25 fps is
+// 40 ms) and the sound crackled under load; 100 ms rides those out. APS5_AUDIO_LATENCY_MS overrides.
+static const std::uint64_t TARGET_LATENCY_US = [] {
+    const char* value = std::getenv("APS5_AUDIO_LATENCY_MS");
+    const auto ms = value != nullptr ? std::strtoull(value, nullptr, 10) : 100ull;
+    return std::clamp<std::uint64_t>(ms, 10, 500) * 1000ull;
+}();
 static constexpr std::uint64_t DRAIN_TIMEOUT_US = 200000;
 static constexpr std::uint64_t DRAIN_SLEEP_US = 1000;
 
@@ -93,6 +99,10 @@ struct Port {
     std::uint64_t virtualQueueEnd = 0;
     SDL_AudioDeviceID device = 0;
     SDL_AudioSpec spec = {};
+    // Recovery of a device Android took away (see recoverDevice).
+    std::uint32_t stalls = 0;
+    std::uint64_t nextReopen = 0;
+    bool lost = false;
 };
 
 static std::mutex g_mutex;
@@ -138,6 +148,30 @@ static void closeDevice(Port& port) {
     }
     port.device = 0;
     port.spec = {};
+}
+
+// Android stops an opened stream when the route changes (headphones, Bluetooth), another app takes
+// the audio focus or the app goes to the background: SDL marks the device stopped and its queue never
+// drains again, so the port stayed silent for the rest of the run. A stopped device, or a queue that
+// stopped draining (several drain timeouts in a row), is closed and opened again; a failed reopen
+// leaves the port virtual (paced, silent) and is retried every second. APS5_NO_AUDIO_RECOVERY=1: off.
+static void recoverDevice(Port& port) {
+    static const bool disabled = std::getenv("APS5_NO_AUDIO_RECOVERY") != nullptr;
+    if (disabled || port.type == PORT_TYPE_VIBRATION) return;
+    const auto status = port.device != 0 ? SDL_GetAudioDeviceStatus(port.device) : SDL_AUDIO_STOPPED;
+    const bool stopped = port.device != 0 && status == SDL_AUDIO_STOPPED;
+    // A paused device (the app in the background: SDL holds its mixer lock) is left alone; closing it
+    // would wait for the resume.
+    if (port.device != 0 && !stopped && (port.stalls < 3 || status != SDL_AUDIO_PLAYING)) return;
+    if (port.device == 0 && !port.lost) return;
+    const auto now = sceKernelGetProcessTime();
+    if (port.device == 0 && now < port.nextReopen) return;
+    if (port.device != 0) std::fprintf(stderr, "[audioout] device %u %s; reopening\n", static_cast<unsigned>(port.device), stopped ? "stopped by the system" : "stopped draining");
+    closeDevice(port);
+    port.stalls = 0;
+    port.lost = !openDevice(port);
+    port.nextReopen = now + 1000000;
+    if (!port.lost) std::fprintf(stderr, "[audioout] device reopened as %u\n", static_cast<unsigned>(port.device));
 }
 
 static constexpr std::uint32_t STD_8CH_MAP[8] = {0, 1, 2, 3, 6, 7, 4, 5};
@@ -248,16 +282,19 @@ static void queueAudio(Port& port, const void* data, std::unique_lock<std::mutex
     const std::uint32_t buffers = bufferUs != 0
         ? static_cast<std::uint32_t>((TARGET_LATENCY_US + bufferUs - 1) / bufferUs)
         : 2u;
-    const std::uint32_t minQueued = queueSize * std::clamp(buffers, 2u, 16u);
+    const std::uint32_t minQueued = queueSize * std::clamp(buffers, 2u, 128u);
     const std::uint64_t waitStart = sceKernelGetProcessTime();
 
+    bool stalled = false;
     while (SDL_GetQueuedAudioSize(port.device) > minQueued) {
         if (sceKernelGetProcessTime() - waitStart > DRAIN_TIMEOUT_US) {
             SDL_ClearQueuedAudio(port.device);
+            stalled = true;
             break;
         }
         sleepUs(lock, DRAIN_SLEEP_US);
     }
+    port.stalls = stalled ? port.stalls + 1 : 0;
 
     if (SDL_QueueAudio(port.device, queueData, queueSize) < 0) {
         throw std::runtime_error(std::string("SDL_QueueAudio: ") + SDL_GetError());
@@ -375,6 +412,7 @@ int APS5_VABI sceAudioOutOutput(int handle, const void* ptr) {
         return -2144993277;
     }
 
+    recoverDevice(*port);
     if (port->device == 0) {
         paceVirtualPort(*port, ptr != nullptr, lock);
     } else {

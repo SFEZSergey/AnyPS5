@@ -772,7 +772,7 @@ VkFormat UintFormatOfSint(VkFormat format) {
 
 VkFormat StorageFormatFor(const Context& context, VkFormat format) {
     const auto storage = StorageFormatOrUndefined(context, format);
-    if (storage == VK_FORMAT_UNDEFINED) Require(false, "guest storage texture format " + std::to_string(format) + " cannot be used as a storage image");
+    if (storage == VK_FORMAT_UNDEFINED) Fail("guest storage texture format " + std::to_string(format) + " cannot be used as a storage image");
     return storage;
 }
 
@@ -1430,7 +1430,7 @@ VkImageView StorageTexture::StorageView(std::uint32_t mip, bool firstLayer) {
     if (format == VK_FORMAT_R32_UINT) return AtomicView(mip, firstLayer);
     const auto found = uintViews.find({mip, firstLayer});
     if (found != uintViews.end()) return found->second;
-    Require(StorageFormatOrUndefined(context, format) == format, "storage image of format " + std::to_string(storageFormat) + " has no storage view of its UINT format " + std::to_string(format));
+    if (!(StorageFormatOrUndefined(context, format) == format)) Fail("storage image of format " + std::to_string(storageFormat) + " has no storage view of its UINT format " + std::to_string(format));
     const auto created = createView(mip, firstLayer, format);
     uintViews.emplace(std::pair{mip, firstLayer}, created);
     return created;
@@ -1555,7 +1555,11 @@ bool StorageTexture::Refresh() {
         const auto equalsOriginal = [&] {
             // Named for the [hooksync] attribution: the compare goes through the flush hook.
             const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
-            return GuestMemory::EqualsCommitted(descriptor.baseAddress, original);
+            // `original` held each layer's bytes at its generation; blocks unstamped since the
+            // oldest of them still do.
+            auto since = generation;
+            for (const auto layer : layerGeneration) since = std::min(since, layer);
+            return GuestMemory::EqualsCommittedSince(descriptor.baseAddress, original, since);
         };
         const auto scanBlocks = [&] {
             blockGenerations(generations);
@@ -1862,6 +1866,67 @@ void StorageTexture::captureGuestBytes(const std::vector<bool>* layers) {
     originalValid = originalValid || complete;
 }
 
+namespace {
+std::atomic<std::uint64_t> presentedFrames{0};
+
+// Без отслеживания записей (Linux без uffd-wp) полное сравнение снимка текстуры на каждый draw
+// съедает почти весь поток драйвера. Debug aid / Android: APS5_TEXTURE_CHECK_PER_FRAME=1 сравнивает
+// текстуру полностью раз в кадр, а между ними — выборкой (64 байта с каждых 4 КиБ) и по признакам
+// GPU-записей; запись CPU мимо выборки становится видна со следующего кадра.
+
+bool sampledEqual(std::uint64_t address, std::span<const std::byte> saved) {
+    constexpr std::size_t stride = 4096;
+    constexpr std::size_t sample = 64;
+    for (std::size_t offset = 0; offset < saved.size(); offset += stride) {
+        const auto bytes = std::min(sample, saved.size() - offset);
+        if (std::memcmp(reinterpret_cast<const void*>(address + offset), saved.data() + offset, bytes) != 0) return false;
+    }
+    const auto tail = std::min(sample, saved.size());
+    return std::memcmp(reinterpret_cast<const void*>(address + saved.size() - tail), saved.data() + saved.size() - tail, tail) == 0;
+}
+
+std::array<std::uint64_t, 3> frameStamp(std::uint64_t address, std::size_t bytes) {
+    const auto* recorder = Recorder::Active();
+    return {GuestMemory::TrackerGeneration(), GuestMemory::ForgetSerial(), recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0};
+}
+
+} // namespace
+
+bool TextureCheckPerFrame() {
+    static const bool enabled = std::getenv("APS5_TEXTURE_CHECK_PER_FRAME") != nullptr;
+    return enabled;
+}
+
+bool FrameCheckHit(FrameCheck& check, std::uint64_t address, std::span<const std::byte> saved) {
+    static const std::uint64_t fullEvery = [] {
+        const char* value = std::getenv("APS5_TEXTURE_FULL_CHECK_FRAMES");
+        return std::max<std::uint64_t>(value != nullptr ? std::strtoull(value, nullptr, 10) : 30, 1);
+    }();
+    if (!TextureCheckPerFrame() || saved.empty() || check.fullFrame == ~0ull) return false;
+    const auto frame = PresentedFrame();
+    const auto stamp = frameStamp(address, saved.size());
+    if ((stamp[1] & 1u) != 0 || stamp != check.stamp) return false;
+    if (check.frame == frame) return true;
+    if (frame - check.fullFrame >= fullEvery) return false;
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(address), saved.size()) || !sampledEqual(address, saved)) return false;
+    check.frame = frame;
+    return true;
+}
+
+void FrameCheckNote(FrameCheck& check, std::uint64_t address, std::size_t bytes) {
+    if (!TextureCheckPerFrame()) return;
+    check.frame = check.fullFrame = PresentedFrame();
+    check.stamp = frameStamp(address, bytes);
+}
+
+void NotePresentedFrame() {
+    presentedFrames.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t PresentedFrame() {
+    return presentedFrames.load(std::memory_order_relaxed);
+}
+
 bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, std::span<std::uint8_t> changed, bool memoize) const {
     if (!originalValid) return false;
     struct Exempt {
@@ -1885,12 +1950,19 @@ bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, 
         return true;
     }
     const auto saved = std::span(original).subspan(static_cast<std::size_t>(address - descriptor.baseAddress), bytes);
+    const bool whole = address == descriptor.baseAddress && bytes == guestBytes;
+    if (whole && FrameCheckHit(comparedFrame, address, saved)) {
+        std::fill(changed.begin(), changed.end(), GuestMemory::BlockUnchanged);
+        return true;
+    }
     if (GuestMemory::EqualsCommittedUnsynced(address, saved)) {
         std::fill(changed.begin(), changed.end(), GuestMemory::BlockUnchanged);
         if (cacheable) comparedGuestBytes = stamp;
+        if (whole) FrameCheckNote(comparedFrame, address, bytes);
         return true;
     }
     comparedGuestBytes = {};
+    comparedFrame = {};
     for (std::size_t index = 0; index < changed.size(); ++index) {
         const auto begin = std::max(address, (first + index) * blockBytes);
         const auto stop = std::min(end, (first + index + 1) * blockBytes);

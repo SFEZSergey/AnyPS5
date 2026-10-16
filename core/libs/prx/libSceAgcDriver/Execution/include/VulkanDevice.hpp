@@ -161,6 +161,9 @@ public:
     void ResolveMemory(std::uint64_t address, std::size_t bytes, bool writable);
     void* Window() const;
     void Resize(std::uint32_t width, std::uint32_t height);
+    // Whether Resize(width, height) would change anything (presenter thread only: the surface state is
+    // changed there alone, so it is read without the GPU mutex).
+    bool NeedsResize(std::uint32_t width, std::uint32_t height) const;
     bool Presentable() const;
     bool DualSrcBlend() const;
     bool PrimitiveListRestart() const;

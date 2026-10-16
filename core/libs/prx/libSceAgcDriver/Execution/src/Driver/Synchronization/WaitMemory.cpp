@@ -11,7 +11,14 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
+#define APS5_SPIN_PAUSE() _mm_pause()
+#elif defined(__aarch64__)
+#define APS5_SPIN_PAUSE() __asm__ __volatile__("yield")
+#else
+#define APS5_SPIN_PAUSE() ((void)0)
+#endif
 #include <algorithm>
 #include <tuple>
 #include <vector>
@@ -335,7 +342,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
         ++polls;
         if (spinning) {
-            _mm_pause();
+            APS5_SPIN_PAUSE();
             if ((polls & 63u) != 0) continue;
             if (std::chrono::steady_clock::now() - spinStart > spinLimit) spinning = false;
         } else if (pauseSpin || polls >= 4000) {

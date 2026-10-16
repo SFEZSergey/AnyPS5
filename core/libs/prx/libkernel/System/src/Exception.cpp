@@ -12,6 +12,12 @@
 #include <stdexcept>
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <cerrno>
+#include <csignal>
+#include <pthread.h>
+#include <system_error>
+#include <ucontext.h>
 #endif
 
 extern "C" Pthread APS5_VABI scePthreadSelf();
@@ -99,6 +105,82 @@ GuestExceptionHandler Handler(int signum) {
     std::lock_guard lock(handlersLock);
     return reinterpret_cast<GuestExceptionHandler>(handlers[signum]);
 }
+
+#ifndef _WIN32
+// A guest exception is carried to its thread by a host real-time signal
+// (glibc keeps the first ones for itself); the handler runs on that thread
+// with its interrupted registers, as RaiseOn does on Windows.
+int DeliverySignal() { return SIGRTMIN + 6; }
+
+void LinuxDeliver(int, siginfo_t*, void* raw) {
+    int signum = 30;
+    if (const Pthread self = scePthreadSelf(); self != nullptr)
+        if (const int pending = self->pendingException.exchange(0, std::memory_order_acq_rel); pending != 0) signum = pending;
+    const auto handler = reinterpret_cast<GuestExceptionHandler>(__atomic_load_n(&handlers[signum], __ATOMIC_ACQUIRE));
+    if (handler == nullptr) return;
+    auto* host = static_cast<ucontext_t*>(raw);
+    auto& g = host->uc_mcontext.gregs;
+    GuestUcontext ucontext{};
+    auto& m = ucontext.mcontext;
+    m.rdi = g[REG_RDI];
+    m.rsi = g[REG_RSI];
+    m.rdx = g[REG_RDX];
+    m.rcx = g[REG_RCX];
+    m.r8 = g[REG_R8];
+    m.r9 = g[REG_R9];
+    m.rax = g[REG_RAX];
+    m.rbx = g[REG_RBX];
+    m.rbp = g[REG_RBP];
+    m.r10 = g[REG_R10];
+    m.r11 = g[REG_R11];
+    m.r12 = g[REG_R12];
+    m.r13 = g[REG_R13];
+    m.r14 = g[REG_R14];
+    m.r15 = g[REG_R15];
+    m.rip = g[REG_RIP];
+    m.rsp = g[REG_RSP];
+    m.rflags = g[REG_EFL];
+    m.cs = g[REG_CSGSFS] & 0xffff;
+    m.len = sizeof(GuestMcontext);
+    // The floating-point state is not passed: hosts such as Box64 hand out a
+    // ucontext whose fpregs pointer is not guaranteed to be readable.
+    handler(signum, &ucontext);
+    g[REG_RDI] = m.rdi;
+    g[REG_RSI] = m.rsi;
+    g[REG_RDX] = m.rdx;
+    g[REG_RCX] = m.rcx;
+    g[REG_R8] = m.r8;
+    g[REG_R9] = m.r9;
+    g[REG_RAX] = m.rax;
+    g[REG_RBX] = m.rbx;
+    g[REG_RBP] = m.rbp;
+    g[REG_R10] = m.r10;
+    g[REG_R11] = m.r11;
+    g[REG_R12] = m.r12;
+    g[REG_R13] = m.r13;
+    g[REG_R14] = m.r14;
+    g[REG_R15] = m.r15;
+    g[REG_RIP] = m.rip;
+    g[REG_RSP] = m.rsp;
+    g[REG_EFL] = m.rflags;
+}
+
+bool RaiseOnLinux(Pthread thread, int signum) {
+    static const bool installed = [] {
+        struct sigaction action {};
+        action.sa_sigaction = &LinuxDeliver;
+        action.sa_flags = SA_SIGINFO | SA_RESTART;
+        sigemptyset(&action.sa_mask);
+        return sigaction(DeliverySignal(), &action, nullptr) == 0;
+    }();
+    if (!installed) throw std::runtime_error("sceKernelRaiseException: cannot install the delivery signal handler");
+    thread->pendingException.store(signum, std::memory_order_release);
+    const int result = pthread_kill(thread->hostThread, DeliverySignal());
+    if (result == ESRCH) return false;
+    if (result != 0) throw std::system_error(result, std::generic_category(), "sceKernelRaiseException: pthread_kill");
+    return true;
+}
+#endif
 
 #ifdef _WIN32
 constexpr std::size_t RedZone = 128;
@@ -367,8 +449,7 @@ int APS5_VABI sceKernelRaiseException(Pthread thread, int signum) {
 #ifdef _WIN32
  return RaiseOn(thread, handler, signum) ? 0 : SCE_KERNEL_ERROR_ESRCH;
 #else
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ return RaiseOnLinux(thread, signum) ? 0 : SCE_KERNEL_ERROR_ESRCH;
 #endif
 }
 

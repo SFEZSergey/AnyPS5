@@ -1,4 +1,11 @@
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <utility>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <dlfcn.h>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -12,6 +19,84 @@
 #include "prx/libScePad/include/PadState.hpp"
 #include "prx/libScePad/include/PadInputTypes.hpp"
 #include "prx/libc/include/General.hpp"
+
+namespace {
+
+// Мост геймпада (APS5_PAD_BRIDGE=<файл>): под Termux /dev/input недоступен, поэтому состояние
+// пишет помощник tools/padbridge, запущенный через su. Раскладка совпадает с padbridge.c.
+struct PadBridgeState {
+    std::uint32_t magic;
+    std::uint32_t sequence;
+    std::uint32_t connected;
+    std::uint32_t buttons;
+    std::uint8_t sticks[4];
+    std::uint8_t l2, r2;
+    std::uint8_t reserved[2];
+};
+
+const volatile PadBridgeState* padBridge() {
+    static const volatile PadBridgeState* const bridge = []() -> const volatile PadBridgeState* {
+        const char* path = std::getenv("APS5_PAD_BRIDGE");
+        if (path == nullptr) return nullptr;
+        const int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            std::fprintf(stderr, "Pad: bridge %s: %s\n", path, std::strerror(errno));
+            return nullptr;
+        }
+        void* map = mmap(nullptr, sizeof(PadBridgeState), PROT_READ, MAP_SHARED, fd, 0);
+        close(fd);
+        if (map == MAP_FAILED) {
+            std::fprintf(stderr, "Pad: bridge mmap %s: %s\n", path, std::strerror(errno));
+            return nullptr;
+        }
+        std::fprintf(stderr, "Pad: reading the gamepad bridge %s\n", path);
+        return static_cast<const volatile PadBridgeState*>(map);
+    }();
+    return bridge;
+}
+
+// Снимок состояния моста под seqlock; false, если геймпад не подключён.
+bool samplePadBridge(PadInputState& result) {
+    const auto* bridge = padBridge();
+    if (bridge == nullptr || bridge->magic != 0x44415041u) return false;
+    PadBridgeState copy{};
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        const std::uint32_t before = bridge->sequence;
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (before & 1u) continue;
+        copy.connected = bridge->connected;
+        copy.buttons = bridge->buttons;
+        for (int i = 0; i < 4; ++i) copy.sticks[i] = bridge->sticks[i];
+        copy.l2 = bridge->l2;
+        copy.r2 = bridge->r2;
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (bridge->sequence == before) break;
+    }
+    if (copy.connected == 0) return false;
+    static constexpr std::pair<std::uint32_t, Pad::PadButton> map[] = {
+        {1u << 0, Pad::PadButton::Cross}, {1u << 1, Pad::PadButton::Circle}, {1u << 2, Pad::PadButton::Square},
+        {1u << 3, Pad::PadButton::Triangle}, {1u << 4, Pad::PadButton::L1}, {1u << 5, Pad::PadButton::R1},
+        {1u << 6, Pad::PadButton::L2}, {1u << 7, Pad::PadButton::R2}, {1u << 8, Pad::PadButton::TouchPad},
+        {1u << 9, Pad::PadButton::Options}, {1u << 11, Pad::PadButton::L3}, {1u << 12, Pad::PadButton::R3},
+        {1u << 13, Pad::PadButton::Up}, {1u << 14, Pad::PadButton::Right}, {1u << 15, Pad::PadButton::Down},
+        {1u << 16, Pad::PadButton::Left}, {1u << 17, Pad::PadButton::TouchPad},
+    };
+    result = PadInputState{};
+    for (const auto& [bit, button] : map) {
+        if (copy.buttons & bit) result.buttons |= static_cast<std::uint32_t>(button);
+    }
+    result.analogButtonsL2 = copy.l2;
+    result.analogButtonsR2 = copy.r2;
+    if (copy.l2 != 0) result.buttons |= static_cast<std::uint32_t>(Pad::PadButton::L2);
+    if (copy.r2 != 0) result.buttons |= static_cast<std::uint32_t>(Pad::PadButton::R2);
+    result.sticks = {copy.sticks[0], copy.sticks[1], copy.sticks[2], copy.sticks[3]};
+    result.deviceKind = 2;
+    // Share (Create) жмёт центр тачпада, как кнопка View у Xbox-пада выше.
+    if (copy.buttons & (1u << 8)) result.touch[0] = {true, 960, 471, 0};
+    return true;
+}
+
+} // namespace
 
 PadInput::PadInput()
     : bindings(Pad::LoadInputMapping()), pressed(bindings.size()), wheelReleaseTimes(bindings.size()) {
@@ -242,6 +327,9 @@ void PadInput::HandleEvent(const SDL_Event& event, DisplayWindow& window) {
     const bool mouse = event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_MOUSEBUTTONUP;
     if (!keyboard && !mouse) return;
     if (ignoreInput) return;
+    // Clicks SDL synthesizes from touches (Android) are not mouse buttons: every touch on the screen
+    // pressed the left-button binding (Square). Touch input comes from the overlay instead.
+    if (mouse && event.button.which == SDL_TOUCH_MOUSEID) return;
     if (keyboard && event.key.repeat != 0) return;
     const bool down = event.type == SDL_KEYDOWN || event.type == SDL_MOUSEBUTTONDOWN;
     for (std::size_t index = 0; index < bindings.size(); ++index) {
@@ -260,11 +348,57 @@ void PadInput::HandleEvent(const SDL_Event& event, DisplayWindow& window) {
     publish();
 }
 
+namespace {
+// libmain's touch overlay state (Android APK); null elsewhere.
+struct VirtualPadState {
+    std::atomic<std::uint32_t> sequence;
+    std::atomic<std::uint32_t> buttons;
+    std::atomic<std::uint32_t> sticks;
+};
+
+const VirtualPadState* virtualPadState() {
+#ifdef __ANDROID__
+    static const VirtualPadState* state = [] () -> const VirtualPadState* {
+        // libmain passes the address (no linker-namespace lookup needed); dlsym as a fallback.
+        if (const char* address = std::getenv("APS5_VIRTUAL_PAD"); address != nullptr && address[0] != '\0') {
+            const auto value = std::strtoull(address, nullptr, 16);
+            if (value != 0) return reinterpret_cast<const VirtualPadState*>(static_cast<std::uintptr_t>(value));
+        }
+        void* main = dlopen("libmain.so", RTLD_NOW | RTLD_NOLOAD);
+        return main != nullptr ? static_cast<const VirtualPadState*>(dlsym(main, "aps5_virtual_pad")) : nullptr;
+    }();
+    return state;
+#else
+    return nullptr;
+#endif
+}
+}
+
 void PadInput::Update() {
+    if (const auto* overlay = virtualPadState(); overlay != nullptr) {
+        const auto sequence = overlay->sequence.load(std::memory_order_acquire);
+        if (sequence != virtualSequence) {
+            virtualSequence = sequence;
+            virtualButtons = overlay->buttons.load(std::memory_order_relaxed);
+            const auto sticks = overlay->sticks.load(std::memory_order_relaxed);
+            for (int axis = 0; axis < 4; ++axis) virtualSticks[static_cast<std::size_t>(axis)] = static_cast<std::uint8_t>(sticks >> (axis * 8));
+            publish();
+        }
+    }
     if (controller != nullptr) SDL_GameControllerUpdate();
     applyOutput();
-    if (controller != nullptr) {
+    PadInputState bridged;
+    static bool bridgeWasConnected = false;
+    if (samplePadBridge(bridged)) {
+        controllerState = bridged;
+        bridgeWasConnected = true;
+        publish();
+    } else if (controller != nullptr) {
         controllerState = sampleController();
+        publish();
+    } else if (bridgeWasConnected) {
+        bridgeWasConnected = false;
+        controllerState = PadInputState{};
         publish();
     }
     const auto now = std::chrono::steady_clock::now();
@@ -342,6 +476,11 @@ void PadInput::publish() {
     if (mouseEnabled) {
         state.sticks[2] = mouseStick[0];
         state.sticks[3] = mouseStick[1];
+    }
+    // Touch overlay: its buttons add to the others, a deflected virtual stick wins over a centred one.
+    state.buttons |= virtualButtons;
+    for (std::size_t axis = 0; axis < state.sticks.size(); ++axis) {
+        if (virtualSticks[axis] < 112 || virtualSticks[axis] > 144) state.sticks[axis] = virtualSticks[axis];
     }
     if (state.analogButtonsL2 != 0) state.buttons |= static_cast<std::uint32_t>(Pad::PadButton::L2);
     if (state.analogButtonsR2 != 0) state.buttons |= static_cast<std::uint32_t>(Pad::PadButton::R2);

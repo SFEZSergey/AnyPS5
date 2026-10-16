@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <cstdint>
 #include <cstddef>
@@ -665,6 +667,7 @@ int APS5_VABI sceKernelCheckReachability(const char* path) {
 int APS5_VABI sceKernelFstat(int d, FileStat* sb) {
     if (sb == nullptr) throw std::invalid_argument("sceKernelFstat: sb is null");
     if (!File::FillFileStatFromDescriptor(d, sb)) return SceErrorFromErrno(errno);
+    if (std::getenv("APS5_TRACE_FILEIO")) std::fprintf(stderr, "[fileio] fstat fd %d\n", d);
     return 0;
 }
 

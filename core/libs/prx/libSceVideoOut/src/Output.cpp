@@ -1,3 +1,4 @@
+#include <cstdio>
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -106,6 +107,7 @@ int APS5_VABI sceVideoOutSetFlipRate(int handle, int rate) try {
     std::lock_guard lock(cfg->mutex);
     cfg->Check();
     cfg->flipRate = rate;
+    std::fprintf(stderr, "[videoout] sceVideoOutSetFlipRate(%d, %d)\n", handle, rate);
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();

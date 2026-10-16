@@ -92,8 +92,8 @@ GuestSamplerResource DecodeSamplerResource(std::span<const std::uint32_t> words,
     if (forceUnormCoords) {
         Require(xyMagFilter == xyMinFilter, "guest sampler descriptor uses unnormalized coordinates with different minification and magnification filters, which is not implemented");
         Require(!isAnisoFilter(xyMagFilter), "guest sampler descriptor uses unnormalized coordinates with anisotropic filtering, which is not implemented");
-        Require(clampX == 2u || clampX == 6u, "guest sampler descriptor uses unnormalized coordinates with clamp mode " + std::to_string(clampX) + " on X; only clamp-to-last-texel and clamp-to-border are implemented");
-        Require(clampY == 2u || clampY == 6u, "guest sampler descriptor uses unnormalized coordinates with clamp mode " + std::to_string(clampY) + " on Y; only clamp-to-last-texel and clamp-to-border are implemented");
+        if (!(clampX == 2u || clampX == 6u)) Fail("guest sampler descriptor uses unnormalized coordinates with clamp mode " + std::to_string(clampX) + " on X; only clamp-to-last-texel and clamp-to-border are implemented");
+        if (!(clampY == 2u || clampY == 6u)) Fail("guest sampler descriptor uses unnormalized coordinates with clamp mode " + std::to_string(clampY) + " on Y; only clamp-to-last-texel and clamp-to-border are implemented");
         Require(!truncCoord, "guest sampler descriptor uses unnormalized coordinates with TRUNC_COORD, which is not implemented");
         Require(!mcCoordTrunc, "guest sampler descriptor uses unnormalized coordinates with MC_COORD_TRUNC, which is not implemented");
     } else {
@@ -113,14 +113,14 @@ GuestSamplerResource DecodeSamplerResource(std::span<const std::uint32_t> words,
     Require(!pointPreclamp, "guest sampler descriptor uses point preclamping which is not implemented");
     static_cast<void>(anisoOverride);
     Require(!blendZeroPrt, "guest sampler descriptor uses PRT blend-zero which is not implemented");
-    if (mipFilter > 2u) Require(false, "guest sampler descriptor uses an unknown mip filter " + std::to_string(mipFilter));
+    if (mipFilter > 2u) Fail("guest sampler descriptor uses an unknown mip filter " + std::to_string(mipFilter));
     Require(mipFilter != 2u || reductionMode == VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT, "guest sampler descriptor combines a min or max reduction with a linear mip filter, which is not implemented");
 
     const auto aniso = isAnisoFilter(xyMagFilter) || isAnisoFilter(xyMinFilter);
     Require(!aniso || reductionMode == VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT, "guest sampler descriptor combines a min or max reduction with anisotropic filtering, which is not implemented");
     auto anisoRatio = 1.0f;
     if (aniso) {
-        if (maxAnisoRatio > 4u) Require(false, "guest sampler descriptor uses an unknown anisotropy ratio " + std::to_string(maxAnisoRatio));
+        if (maxAnisoRatio > 4u) Fail("guest sampler descriptor uses an unknown anisotropy ratio " + std::to_string(maxAnisoRatio));
         const std::array ratios{1.0f, 2.0f, 4.0f, 8.0f, 16.0f};
         anisoRatio = ratios[maxAnisoRatio];
     }

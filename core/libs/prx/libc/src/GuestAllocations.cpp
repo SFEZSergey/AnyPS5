@@ -233,45 +233,78 @@ void GuestAllocationsUnregisterImage_nid_postfix(void* mutation, const void* ima
 void GuestAllocationsRegisterMainImage_nid_postfix(void*) {
     auto& state = registry();
     if (state.mainImageRegistered) return;
-    struct Page {
-        bool readable = false;
-        bool writable = false;
+    // Сегменты PT_LOAD первого образа как отрезки [start, end) с правами. Раньше образ раскладывался
+    // по страницам в std::map: у PvZ это ~40 млн страниц (~160 ГБ адресов) — 10+ с и гигабайты памяти
+    // на старте. Теперь: разбиение по границам сегментов и слияние соседних кусков с одинаковыми правами
+    // (результат тот же, что у постраничного объединения).
+    struct Segment {
+        std::uint64_t start;
+        std::uint64_t end;
+        bool readable;
+        bool writable;
     };
-    std::map<std::uint64_t, Page> pages;
+    std::vector<Segment> segments;
     const auto pageSize = static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE));
-    std::pair<std::map<std::uint64_t, Page>*, std::uint64_t> collection{&pages, pageSize};
+    std::pair<std::vector<Segment>*, std::uint64_t> collection{&segments, pageSize};
     dl_iterate_phdr([](dl_phdr_info* image, std::size_t, void* data) {
-        auto& collected = *static_cast<std::pair<std::map<std::uint64_t, Page>*, std::uint64_t>*>(data);
+        auto& collected = *static_cast<std::pair<std::vector<Segment>*, std::uint64_t>*>(data);
         for (int index = 0; index < image->dlpi_phnum; ++index) {
             const auto& header = image->dlpi_phdr[index];
             if (header.p_type != PT_LOAD || header.p_memsz == 0) continue;
             const auto start = (image->dlpi_addr + header.p_vaddr) & ~(collected.second - 1);
             const auto end = (image->dlpi_addr + header.p_vaddr + header.p_memsz + collected.second - 1) & ~(collected.second - 1);
-            for (auto page = start; page < end; page += collected.second) {
-                auto& entry = (*collected.first)[page];
-                entry.readable = entry.readable || (header.p_flags & (PF_R | PF_W)) != 0;
-                entry.writable = entry.writable || (header.p_flags & PF_W) != 0;
-            }
+            collected.first->push_back({start, end, (header.p_flags & (PF_R | PF_W)) != 0, (header.p_flags & PF_W) != 0});
         }
         return 1;
     }, &collection);
-    require(!pages.empty(), "main guest image has no loadable segments");
-    auto replacement = state.ranges;
-    for (auto page = pages.begin(); page != pages.end();) {
-        auto last = page;
-        while (std::next(last) != pages.end() && std::next(last)->first == last->first + pageSize && std::next(last)->second.readable == page->second.readable && std::next(last)->second.writable == page->second.writable) ++last;
-        const auto address = page->first;
-        const auto bytes = static_cast<std::size_t>(last->first + pageSize - address);
+    require(!segments.empty(), "main guest image has no loadable segments");
+    std::vector<std::uint64_t> bounds;
+    for (const auto& segment : segments) {
+        bounds.push_back(segment.start);
+        bounds.push_back(segment.end);
+    }
+    std::sort(bounds.begin(), bounds.end());
+    bounds.erase(std::unique(bounds.begin(), bounds.end()), bounds.end());
+    struct Piece {
+        std::uint64_t start;
+        std::uint64_t end;
+        bool readable;
+        bool writable;
+    };
+    std::vector<Piece> pieces;
+    for (std::size_t index = 0; index + 1 < bounds.size(); ++index) {
+        const auto first = bounds[index];
+        const auto last = bounds[index + 1];
+        bool covered = false, readable = false, writable = false;
+        for (const auto& segment : segments) {
+            if (segment.start <= first && last <= segment.end) {
+                covered = true;
+                readable = readable || segment.readable;
+                writable = writable || segment.writable;
+            }
+        }
+        if (!covered) continue;
+        if (!pieces.empty() && pieces.back().end == first && pieces.back().readable == readable && pieces.back().writable == writable) pieces.back().end = last;
+        else pieces.push_back({first, last, readable, writable});
+    }
+    auto& replacement = state.ranges;
+    for (const auto& piece : pieces) {
+        const auto address = piece.start;
+        const auto bytes = static_cast<std::size_t>(piece.end - piece.start);
         const auto next = replacement.lower_bound(address);
         require(next == replacement.end() || address + bytes <= next->first, "guest image overlaps a registered allocation");
         if (next != replacement.begin()) {
             const auto& previous = *std::prev(next)->second;
             require(previous.address + previous.bytes <= address, "guest image overlaps a registered allocation");
         }
-        replacement.emplace(address, std::make_shared<const Range>(Range{address, bytes, page->second.readable, page->second.writable, address, bytes, false}));
-        page = std::next(last);
     }
-    state.ranges.swap(replacement);
+    for (const auto& piece : pieces) {
+        const auto bytes = static_cast<std::size_t>(piece.end - piece.start);
+        replacement.emplace(piece.start, std::make_shared<const Range>(Range{piece.start, bytes, piece.readable, piece.writable, piece.start, bytes, false}));
+    }
+    std::fprintf(stderr, "[guestalloc] main image: %zu segments -> %zu ranges", segments.size(), pieces.size());
+    for (const auto& piece : pieces) std::fprintf(stderr, " [0x%llx+0x%llx %c%c]", static_cast<unsigned long long>(piece.start), static_cast<unsigned long long>(piece.end - piece.start), piece.readable ? 'r' : '-', piece.writable ? 'w' : '-');
+    std::fprintf(stderr, "\n");
     state.mainImageRegistered = true;
 }
 #endif
@@ -345,10 +378,23 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
     }
 }
 
+namespace {
+
+// Первый элемент реестра, который может пересекать address (начинается не позже него).
+std::map<std::uint64_t, std::shared_ptr<const Range>>::const_iterator firstCandidate(std::uintptr_t address) {
+    const auto& ranges = registry().ranges;
+    auto it = ranges.upper_bound(address);
+    if (it != ranges.begin()) --it;
+    return it;
+}
+
+}
+
 void GuestAllocationsRequireAvailable_nid_postfix(void*, const void* pointer, std::size_t bytes) {
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
     require(address != 0 && bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address, "invalid fixed guest mapping");
-    for (const auto& [base, range] : registry().ranges) {
+    for (auto it = firstCandidate(address); it != registry().ranges.end(); ++it) {
+        const auto& [base, range] = *it;
         if (base >= address + bytes) break;
         if (base + range->bytes > address) {
             char message[160];
@@ -361,7 +407,8 @@ void GuestAllocationsRequireAvailable_nid_postfix(void*, const void* pointer, st
 bool GuestAllocationsOverlaps_nid_postfix(void*, const void* pointer, std::size_t bytes) {
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
     require(address != 0 && bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address, "invalid guest allocation range");
-    for (const auto& [base, range] : registry().ranges) {
+    for (auto it = firstCandidate(address); it != registry().ranges.end(); ++it) {
+        const auto& [base, range] = *it;
         if (base >= address + bytes) break;
         if (base + range->bytes > address) return true;
     }
@@ -373,7 +420,8 @@ bool GuestAllocationsCovers_nid_postfix(void*, const void* pointer, std::size_t 
     require(address != 0 && bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address, "invalid guest allocation range");
     const auto end = address + bytes;
     auto cursor = address;
-    for (const auto& [base, range] : registry().ranges) {
+    for (auto it = firstCandidate(address); it != registry().ranges.end(); ++it) {
+        const auto& [base, range] = *it;
         const auto finish = base + range->bytes;
         if (finish <= cursor) continue;
         if (base > cursor || !range->releasable) return false;
@@ -391,7 +439,9 @@ Range GuestAllocationsFind_nid_postfix(void*, const void* pointer) {
         require(range.releasable, "guest image memory is not a releasable allocation");
         return {address, range.allocationBytes, range.readable, range.writable, address, range.allocationBytes, range.releasable, range.gpu};
     }
-    for (const auto& [base, range] : registry().ranges) {
+    for (auto it = registry().ranges.lower_bound(address); it != registry().ranges.end(); ++it) {
+        const auto& range = it->second;
+        if (range->allocationAddress > address) break; // выделения не пересекаются: дальше только более поздние
         if (range->allocationAddress == address) {
             require(range->releasable, "guest image memory is not a releasable allocation");
             return {address, range->allocationBytes, range->readable, range->writable, address, range->allocationBytes, range->releasable, range->gpu};
@@ -410,27 +460,58 @@ void GuestAllocationsRemove_nid_postfix(void* mutation, const void* pointer) {
         ranges.erase(exact);
         return;
     }
-    std::erase_if(ranges, [&](const auto& entry) { return entry.second->allocationAddress == range.address; });
+    // Куски выделения лежат в [address, address + bytes).
+    for (auto it = ranges.lower_bound(range.address); it != ranges.end() && it->first < range.address + range.bytes;) {
+        if (it->second->allocationAddress == range.address) it = ranges.erase(it);
+        else ++it;
+    }
 }
 
 namespace {
 
-std::map<std::uint64_t, std::shared_ptr<const Range>> replaceRange(const void* pointer, std::size_t bytes, bool remove, bool readable, bool writable, bool gpu) {
+// Правка реестра для Protect/Unmap: удаляемые ключи и вставляемые куски. Считается без копирования
+// всего реестра (раньше каждая mprotect/munmap гостя копировала std::map целиком — O(N) на вызов,
+// при загрузке игры это минуты под эмуляцией) и применяется только после успешного apply().
+struct RangeEdit {
+    std::vector<std::uint64_t> erased;
+    std::vector<std::pair<std::uint64_t, std::shared_ptr<const Range>>> inserted;
+
+    void Commit() const {
+        auto& ranges = registry().ranges;
+        for (const auto base : erased) ranges.erase(base);
+        for (const auto& [base, entry] : inserted) ranges.emplace(base, entry);
+    }
+};
+
+RangeEdit replaceRange(const void* pointer, std::size_t bytes, bool remove, bool readable, bool writable, bool gpu, bool keepSame = false) {
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
     require(bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address, "invalid guest protection or unmap range");
     require(!writable || readable, "writable guest allocation must be readable");
     const auto end = address + bytes;
-    auto replacement = registry().ranges;
+    const auto& ranges = registry().ranges;
+    RangeEdit edit;
     auto cursor = address;
-    for (const auto& [base, entry] : registry().ranges) {
-        const auto& range = *entry;
+    // Первый кандидат — диапазон, начинающийся не позже address (он может его покрывать).
+    auto it = ranges.upper_bound(address);
+    if (it != ranges.begin()) --it;
+    for (; it != ranges.end(); ++it) {
+        const auto base = it->first;
+        const auto& range = *it->second;
         const auto finish = base + range.bytes;
         if (finish <= address) continue;
         if (base >= end) break;
         require(base <= cursor, "guest protection or unmap range has a hole");
-        replacement.erase(base);
+        // Те же права — диапазон не меняется: прежний объект остаётся (драйвер привязывает к нему
+        // импорт в GPU; новый объект на каждую mprotect гостя с теми же правами заставлял заново
+        // закреплять в GPU всё выделение). APS5_PROTECT_REPLACES_RANGES=1 — как раньше.
+        static const bool replaceAlways = std::getenv("APS5_PROTECT_REPLACES_RANGES") != nullptr;
+        if (keepSame && !remove && !replaceAlways && range.readable == readable && range.writable == writable && range.gpu == gpu) {
+            cursor = std::min(finish, end);
+            continue;
+        }
+        edit.erased.push_back(base);
         const auto insert = [&](std::uint64_t first, std::uint64_t last, bool canRead, bool canWrite, bool gpuMapped) {
-            if (first < last) replacement.emplace(first, std::make_shared<const Range>(Range{first, static_cast<std::size_t>(last - first), canRead, canWrite, range.allocationAddress, range.allocationBytes, range.releasable, gpuMapped}));
+            if (first < last) edit.inserted.emplace_back(first, std::make_shared<const Range>(Range{first, static_cast<std::size_t>(last - first), canRead, canWrite, range.allocationAddress, range.allocationBytes, range.releasable, gpuMapped}));
         };
         insert(base, std::max(base, address), range.readable, range.writable, range.gpu);
         if (!remove) insert(std::max(base, address), std::min(finish, end), readable, writable, gpu);
@@ -438,7 +519,22 @@ std::map<std::uint64_t, std::shared_ptr<const Range>> replaceRange(const void* p
         cursor = std::min(finish, end);
     }
     require(cursor == end, "guest protection or unmap range is not registered");
-    return replacement;
+    return edit;
+}
+
+// Остаются ли после правки куски выделения allocation (ищем только в его пределах).
+bool allocationSurvives(const RangeEdit& edit, const Range& allocation) {
+    const auto& ranges = registry().ranges;
+    const auto first = allocation.allocationAddress;
+    const auto last = first + allocation.allocationBytes;
+    for (auto it = ranges.lower_bound(first); it != ranges.end() && it->first < last; ++it) {
+        if (it->second->allocationAddress != first) continue;
+        if (std::find(edit.erased.begin(), edit.erased.end(), it->first) == edit.erased.end()) return true;
+    }
+    for (const auto& [base, entry] : edit.inserted) {
+        if (entry->allocationAddress == first) return true;
+    }
+    return false;
 }
 
 }
@@ -446,9 +542,19 @@ std::map<std::uint64_t, std::shared_ptr<const Range>> replaceRange(const void* p
 void GuestAllocationsProtect_nid_postfix(void* mutation, const void* pointer, std::size_t bytes, bool readable, bool writable, bool gpu, const std::function<void()>& apply) {
     GuestAllocationsRequireUnpinned_nid_postfix(mutation, pointer, bytes);
     recordChange(mutation, pointer, bytes);
-    auto replacement = replaceRange(pointer, bytes, false, readable, writable, gpu);
+    const auto edit = replaceRange(pointer, bytes, false, readable, writable, gpu);
     apply();
-    registry().ranges.swap(replacement);
+    edit.Commit();
+}
+
+// Protect для обычной mprotect гостя (страницы те же): куски с прежними правами остаются прежними
+// объектами. Перемапливание (новые страницы) идёт через GuestAllocationsProtect — там объект новый.
+void GuestAllocationsProtectKeep_nid_postfix(void* mutation, const void* pointer, std::size_t bytes, bool readable, bool writable, bool gpu, const std::function<void()>& apply) {
+    GuestAllocationsRequireUnpinned_nid_postfix(mutation, pointer, bytes);
+    recordChange(mutation, pointer, bytes);
+    const auto edit = replaceRange(pointer, bytes, false, readable, writable, gpu, true);
+    apply();
+    edit.Commit();
 }
 
 void GuestAllocationsUnmap_nid_postfix(void* mutation, const void* pointer, std::size_t bytes, const std::function<void(const void*, std::size_t, const void*, bool)>& apply) {
@@ -472,17 +578,23 @@ void GuestAllocationsUnmap_nid_postfix(void* mutation, const void* pointer, std:
         const auto range = *containing;
         require(range.releasable, "guest image memory cannot be unmapped");
         const auto pieceEnd = std::min<std::uint64_t>(end, range.allocationAddress + range.allocationBytes);
-        auto replacement = replaceRange(reinterpret_cast<const void*>(cursor), pieceEnd - cursor, true, false, false, false);
-        bool last = true;
-        for (const auto& [base, entry] : replacement) {
-            if (entry->allocationAddress == range.allocationAddress) last = false;
-        }
+        const auto edit = replaceRange(reinterpret_cast<const void*>(cursor), pieceEnd - cursor, true, false, false, false);
+        const bool last = !allocationSurvives(edit, range);
         apply(reinterpret_cast<const void*>(cursor), pieceEnd - cursor, reinterpret_cast<const void*>(range.allocationAddress), last);
-        registry().ranges.swap(replacement);
+        edit.Commit();
         any = true;
         cursor = pieceEnd;
     }
     require(any, "unmap address is not registered");
+}
+
+std::uint64_t GuestAllocationsReadableEnd_nid_postfix(std::uintptr_t begin, std::uintptr_t end) {
+    std::lock_guard lock(registry().mutex);
+    const auto& ranges = registry().ranges;
+    auto it = ranges.upper_bound(begin);
+    if (it == ranges.begin()) return 0;
+    const auto& range = *std::prev(it)->second;
+    return range.readable && range.bytes != 0 && begin >= range.address && end <= range.address + range.bytes ? range.address + range.bytes : 0;
 }
 
 Lease GuestAllocationsAcquire_nid_postfix() {

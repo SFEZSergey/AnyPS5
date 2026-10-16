@@ -171,7 +171,7 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
             Require(baseArray <= depth, "guest cube texture descriptor has a base array past its last array slice");
             if (baseArray == depth) depth += 5u;
             if ((depth - baseArray + 1u) % 6u != 0) {
-                Require(false, "guest cube texture descriptor does not contain a multiple of 6 array slices" +
+                Fail("guest cube texture descriptor does not contain a multiple of 6 array slices" +
                     describe() + " (base array " + std::to_string(baseArray) + ")");
             }
             break;
@@ -201,7 +201,7 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
     result.dccPipeAligned = metaPipeAligned;
     result.minLod = minLod;
     if (baseLevel > maxMip) {
-        Require(LevelsFitAllocation(result, lastLevel + 1u), "guest texture descriptor starts past the surface's last mip level at levels that would move the surface's own" + describe());
+        if (!(LevelsFitAllocation(result, lastLevel + 1u))) Fail("guest texture descriptor starts past the surface's last mip level at levels that would move the surface's own" + describe());
         result.mipCount = lastLevel + 1u;
     }
     return result;

@@ -33,6 +33,9 @@ struct HostImport {
     std::uint64_t serial = 0;
     bool unwatched = false;
     bool dmaBuf = false;
+    // Android: steady-clock ns after which a compared host-pointer import returns to the write watch
+    // (0: not pending). Deferred so the loads that fill a fresh import do not fault page by page.
+    std::int64_t rewatchAtNs = 0;
     std::shared_ptr<void> chunk;
 };
 
@@ -52,6 +55,8 @@ ImportProbe ProbeImportWriteProtection(const Context& context);
 ImportProbe ProbeDmaBufImportWriteProtection(const Context& context);
 ImportWatch PrepareImportWatch(const Context& context);
 void SetImportWatch(const Context& context, ImportWatch watch);
+// Returns host-pointer imports past their rewatch delay to the write watch (once a frame).
+void RewatchSettledImports();
 
 // The host import of the registered allocation containing [address, address + bytes), made on demand
 // (alignment and budget permitting), or null. Bytes at `address` are at `address - import->base` in

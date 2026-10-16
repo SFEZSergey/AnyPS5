@@ -217,7 +217,7 @@ void requireCmaskCodes(std::uint32_t codes) {
     for (std::uint32_t code = 1; code < 15; ++code) {
         if ((codes >> code) & 1u) listed += (listed.empty() ? "" : ", ") + std::to_string(code);
     }
-    Require(false, "CMASK codes " + listed + " were recorded, which are not a single-sample fast-clear code (0 cleared, 15 expanded)");
+    Fail("CMASK codes " + listed + " were recorded, which are not a single-sample fast-clear code (0 cleared, 15 expanded)");
 }
 
 CmaskState readCmask(const ColorTarget& color, const CmaskLayout& layout, std::vector<std::uint32_t>& cleared) {
@@ -247,7 +247,7 @@ CmaskState readCmask(const ColorTarget& color, const CmaskLayout& layout, std::v
             const auto nibble = layout.Nibble(tileX, tileY);
             const auto code = (std::to_integer<std::uint32_t>(mask[nibble / 2u]) >> ((nibble % 2u) * 4u)) & 0xfu;
             if (code == 0u) cleared.push_back(tileY * layout.TilesX() + tileX);
-            else Require(code == 0xfu, "CMASK code " + std::to_string(code) + " of color target " + hexAddress(color.address) + " is not a single-sample fast-clear code (0 cleared, 15 expanded)");
+            else if (!(code == 0xfu)) Fail("CMASK code " + std::to_string(code) + " of color target " + hexAddress(color.address) + " is not a single-sample fast-clear code (0 cleared, 15 expanded)");
         }
     }
     if (cleared.empty()) return CmaskState::Expanded;
@@ -1247,7 +1247,18 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     // The render target and index ranges stay out of the key (see DrawResourceKey); a hit repeats
     // the alias checks instead. Debug aid: APS5_NO_DRAW_KEY_TRIM=1 keys them as before.
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
-    resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
+    // Стадии, которые драйвер генерирует сам (геометрия и тесселяция развёртки RECT_LIST), не имеют
+    // идентификатора варианта, как и в ValidationKey; без этого исключения кэш выключался для всех
+    // draw-вызовов прямоугольниками (весь 2D-интерфейс). Выигрыша на PvZ не дало (попадание всё равно
+    // перепроверяет текстуры), поэтому включается явно: APS5_GENERATED_STAGE_CACHE=1.
+    static const bool noGeneratedStageCache = std::getenv("APS5_GENERATED_STAGE_CACHE") == nullptr;
+    const auto hasVariant = [&](const CompiledShader& shader) {
+        using Stage = ShaderRecompiler::ShaderStage;
+        if (shader.program == nullptr) return false;
+        const bool generated = (state.rectList && (shader.stage == Stage::TessellationControl || shader.stage == Stage::TessellationEvaluation)) || shader.stage == Stage::Geometry;
+        return shader.program->PipelineVariantId() != 0 || (generated && !noGeneratedStageCache);
+    };
+    resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), hasVariant) && !ShaderResources::NeverReusable(shaders);
     if (resolved.cacheable) {
         resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
         if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
@@ -1270,6 +1281,16 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         }
     } else {
         countCache(&DrawProfile::uncacheable);
+        // Причины некэшируемости (APS5_PROFILE_DRAW): каждые 2000 draw-вызовов.
+        static const bool why = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        if (why) {
+            static std::atomic<std::uint64_t> notRecordable{0}, noVariant{0}, neverReusable{0}, disabled{0}, total{0};
+            if (noDrawResourceCache || noTextureCache) ++disabled;
+            else if (!recordable) ++notRecordable;
+            else if (!std::all_of(shaders.begin(), shaders.end(), hasVariant)) ++noVariant;
+            else ++neverReusable;
+            if (++total % 2000 == 0) std::fprintf(stderr, "[rescache] uncacheable reasons: not recordable %llu, no variant %llu, never reusable %llu, disabled %llu\n", static_cast<unsigned long long>(notRecordable.load()), static_cast<unsigned long long>(noVariant.load()), static_cast<unsigned long long>(neverReusable.load()), static_cast<unsigned long long>(disabled.load()));
+        }
     }
     timer.phase(PhaseLookup);
     if (resolved.resources == nullptr) {
@@ -1812,7 +1833,18 @@ std::optional<std::string> KnownValidationFailure(const Context& context, std::s
     return std::nullopt;
 }
 
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {
+// The hardware drops an incomplete trailing rect (fewer than three vertices left).
+const Pm4::DrawParameters& TrimRectList(const State& state, const Pm4::DrawParameters& draw, Pm4::DrawParameters& storage) {
+    if (!state.rectList || draw.indirect || draw.indexCount % 3 == 0) return draw;
+    storage = draw;
+    storage.indexCount -= draw.indexCount % 3;
+    return storage;
+}
+
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& requested, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {
+    Pm4::DrawParameters trimmed;
+    const auto& draw = TrimRectList(state, requested, trimmed);
+    if (state.rectList && !draw.indirect && draw.indexCount == 0) return;
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     PerformanceTimer timing("Graphics.Draw");
     // APS5_PROFILE_DRAW prints the time of each phase of the draw (microseconds) and the [draws] totals.
@@ -2362,7 +2394,9 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     APS5_LOG_CHARS_OUT_DEBUG("Draw finished");
 }
 
-DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe) {
+DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& requested, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe) {
+    Pm4::DrawParameters trimmed;
+    const auto& draw = TrimRectList(state, requested, trimmed);
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     static_cast<void>(snapshots);
     PerformanceTimer timing("Graphics.DrawWithRecipe");
@@ -2492,7 +2526,7 @@ void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass)
             if (const auto resident = metadataPassResident(context, color)) resident->Refresh();
             continue;
         }
-        Require(IsDccClear(keys), std::string("CB metadata pass over DCC keys that are ") + DccKeysName(keys) + " (per-block metadata is not modeled)");
+        if (!(IsDccClear(keys))) Fail(std::string("CB metadata pass over DCC keys that are ") + DccKeysName(keys) + " (per-block metadata is not modeled)");
         const auto texel = clearTexel(color, keys);
         const auto resident = metadataPassResident(context, color);
         if (resident != nullptr) {

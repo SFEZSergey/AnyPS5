@@ -1,4 +1,9 @@
-add_png_decoder(decoder_png libc)
+if(APS5_NATIVE_GROUP)
+    # Нативная группа (VideoOut читает иконку приложения): libc остаётся x86, нужен только shim.
+    add_png_decoder(decoder_png aps5coreshim)
+else()
+    add_png_decoder(decoder_png libc)
+endif()
 
 add_library(libScePngDec SHARED EXCLUDE_FROM_ALL ${CMAKE_CURRENT_SOURCE_DIR}/Export.cpp)
 target_include_directories(libScePngDec PRIVATE ${LIBS_INCLUDE_DIR})

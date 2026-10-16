@@ -160,6 +160,14 @@ void _readFile(const Apr::ReadFileCommand& command) {
     if (stream.bad()) throw std::runtime_error("APR: read failed for " + file.path.string());
     const auto read = static_cast<std::uint64_t>(stream.gcount());
     if (read != command.size) throw std::runtime_error("APR: read of " + file.path.string() + " at offset " + std::to_string(command.offset) + " returned " + std::to_string(read) + " of " + std::to_string(command.size) + " bytes");
+    if (trace) {
+        const auto* bytes = reinterpret_cast<const unsigned char*>(command.destination);
+        char preview[49];
+        const std::size_t shown = command.size < 48 ? static_cast<std::size_t>(command.size) : 48;
+        for (std::size_t i = 0; i < shown; ++i) preview[i] = bytes[i] >= 32 && bytes[i] < 127 ? static_cast<char>(bytes[i]) : '.';
+        preview[shown] = 0;
+        std::fprintf(stderr, "[apr]   data: %s\n", preview);
+    }
 }
 
 void _writeAddress(const Apr::WriteAddressCommand& command) {

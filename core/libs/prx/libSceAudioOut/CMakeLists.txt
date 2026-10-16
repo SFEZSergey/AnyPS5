@@ -13,7 +13,11 @@ target_include_directories(libSceAudioOut PRIVATE
         ${LIBS_INCLUDE_DIR}
         ${CMAKE_SOURCE_DIR}/3rdparty/SDL2/include
 )
-target_link_libraries(libSceAudioOut PRIVATE libc libkernel SDL2-static)
+if(APS5_NATIVE_GROUP)
+    target_link_libraries(libSceAudioOut PRIVATE aps5coreshim SDL2-static)
+else()
+    target_link_libraries(libSceAudioOut PRIVATE libc libkernel SDL2-static)
+endif()
 configure_windows_unwind(libSceAudioOut)
 
 if(BUILD_TESTING)
