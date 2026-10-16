@@ -465,6 +465,16 @@ static unsigned __stdcall StartNativeThread(void* opaque) {
     return 0;
 }
 #else
+// The guest's thread name on the host thread (top, perf, /proc): Linux keeps 15 characters, so a
+// longer name keeps its start and its last 4 characters ("Background Job.Worker 12" -> "Background~r 12").
+static void SetHostThreadName(pthread_t thread, const std::string& name) {
+    if (name.empty()) return;
+    char host[16];
+    if (name.size() <= 15) std::snprintf(host, sizeof(host), "%s", name.c_str());
+    else std::snprintf(host, sizeof(host), "%.10s~%s", name.c_str(), name.c_str() + name.size() - 4);
+    pthread_setname_np(thread, host);
+}
+
 static void* StartNativeThread(void* opaque) {
     std::unique_ptr<NativeThreadArgs> args(static_cast<NativeThreadArgs*>(opaque));
     auto* self = args->guest->self;
@@ -476,6 +486,10 @@ static void* StartNativeThread(void* opaque) {
             throw std::runtime_error("Cannot query guest thread stack");
         self->stackAddress = reinterpret_cast<void*>(high - reserve - self->stackSize);
         self->threadId = std::this_thread::get_id();
+        {
+            std::lock_guard lock(self->nameLock);
+            SetHostThreadName(pthread_self(), self->name);
+        }
         args->initialized.set_value();
     } catch (...) {
         args->initialized.set_exception(std::current_exception());
@@ -744,6 +758,8 @@ int APS5_VABI scePthreadRename(Pthread thread, const char* name) {
     const std::wstring description(thread->name.begin(), thread->name.end());
     SetThreadDescription(static_cast<HANDLE>(thread->nativeHandle), description.c_str());
     ApplyJobAffinity(*thread, thread->nativeHandle);
+#else
+    if (thread->threadId != std::thread::id{}) SetHostThreadName(thread->hostThread, thread->name);
 #endif
     return SCE_OK;
 }

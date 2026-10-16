@@ -9,6 +9,12 @@ public:
 
 private:
     bool focused = true;
+    // Android: a real device was used (see HandleEvent); until then the game has none.
+#ifdef __ANDROID__
+    bool seen = false;
+#else
+    bool seen = true;
+#endif
 };
 
 #endif

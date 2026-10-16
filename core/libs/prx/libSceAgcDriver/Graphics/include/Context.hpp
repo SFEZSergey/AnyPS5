@@ -40,8 +40,14 @@ inline void Check(VkResult result, const char* operation) {
     throw std::runtime_error("AGC graphics: " + reason);
 }
 
-inline void Require(bool condition, const char* reason) {
-    if (!condition) throw std::runtime_error(std::string("AGC graphics: ") + reason);
+// Out of line and cold: with the message built inline, Require itself stayed a call on every check
+// of every draw (about 1% of the recorder thread).
+[[noreturn, gnu::cold, gnu::noinline]] inline void RequireFailed(const char* reason) {
+    throw std::runtime_error(std::string("AGC graphics: ") + reason);
+}
+
+[[gnu::always_inline]] inline void Require(bool condition, const char* reason) {
+    if (!condition) [[unlikely]] RequireFailed(reason);
 }
 
 // Device entry points resolved once per device (VulkanDevice's State fills it after setup): the

@@ -54,7 +54,8 @@ void DrawPipeline::run() {
         jobs.pop_front();
         running = std::move(job.writes);
         lock.unlock();
-        const auto start = std::chrono::steady_clock::now();
+        const bool timed = Profiled();
+        const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         std::exception_ptr error;
         try {
             job.work();
@@ -62,7 +63,7 @@ void DrawPipeline::run() {
             error = std::current_exception();
         }
         job.work = nullptr;
-        recordedNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+        if (timed) recordedNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
         lock.lock();
         running.clear();
         if (error != nullptr && failure == nullptr) failure = error;

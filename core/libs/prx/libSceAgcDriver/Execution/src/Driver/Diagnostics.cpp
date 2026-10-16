@@ -9,10 +9,8 @@ double TraceMs() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - origin).count();
 }
 
-void require(bool condition, const char* reason) {
-    if (!condition) {
-        throw std::runtime_error(std::string("AGC driver: ") + reason);
-    }
+void requireFailed(const char* reason) {
+    throw std::runtime_error(std::string("AGC driver: ") + reason);
 }
 
 std::uint32_t readRegister(const Registers& registers, std::uint32_t offset) {

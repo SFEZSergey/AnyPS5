@@ -13,7 +13,12 @@ int head = 0;
 int count = 0;
 bool initialized = false;
 bool opened = false;
+// Android: no keyboard until a real key is pressed (see the mouse: no second input device for the game).
+#ifdef __ANDROID__
+bool connected = false;
+#else
 bool connected = true;
+#endif
 std::uint32_t led = 0;
 std::uint32_t modifiers = 0;
 std::array<std::uint16_t, KEYBOARD_MAX_KEYCODES> keys{};

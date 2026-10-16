@@ -5,6 +5,18 @@
 
 void MouseInput::HandleEvent(const SDL_Event& event, unsigned windowId) {
     MouseInputEvent input{};
+    // The mouse SDL synthesizes from touches is not a mouse: on a phone every touch of the touch
+    // controls also moved and clicked it, a second input device (player 2) for the game.
+    if ((event.type == SDL_MOUSEMOTION && event.motion.which == SDL_TOUCH_MOUSEID) ||
+        ((event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_MOUSEBUTTONUP) && event.button.which == SDL_TOUCH_MOUSEID) ||
+        (event.type == SDL_MOUSEWHEEL && event.wheel.which == SDL_TOUCH_MOUSEID))
+        return;
+    if (!seen && (event.type == SDL_MOUSEMOTION || event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_MOUSEBUTTONUP || event.type == SDL_MOUSEWHEEL)) {
+        seen = true;
+        MouseInputEvent connect{};
+        connect.connectionChange = true;
+        MousePublishInput_nid_postfix(connect);
+    }
     switch (event.type) {
         case SDL_MOUSEMOTION:
             if (event.motion.windowID != windowId || !focused) return;
@@ -39,6 +51,7 @@ void MouseInput::HandleEvent(const SDL_Event& event, unsigned windowId) {
                 input.resetButtons = true;
             } else if (event.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {
                 focused = true;
+                if (!seen) return;
                 input.connectionChange = true;
             } else if (event.window.event == SDL_WINDOWEVENT_CLOSE) {
                 focused = false;

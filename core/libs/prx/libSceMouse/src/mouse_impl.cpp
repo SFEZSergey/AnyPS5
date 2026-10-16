@@ -12,7 +12,13 @@ int head = 0;
 int count = 0;
 bool initialized = false;
 bool opened = false;
+// Android: the screen's touches drive the pad (touch overlay); a mouse is reported only once a real
+// one is used (the video-out input layer connects it), so the game sees no second input device.
+#ifdef __ANDROID__
+bool connected = false;
+#else
 bool connected = true;
+#endif
 std::uint32_t buttons = 0;
 
 void enqueue(const MouseData& data) {

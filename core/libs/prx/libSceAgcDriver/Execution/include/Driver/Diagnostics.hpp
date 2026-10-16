@@ -8,7 +8,12 @@ namespace AgcDriver::DriverDetail {
 
 double TraceMs();
 
-void require(bool condition, const char* reason);
+[[noreturn, gnu::cold, gnu::noinline]] void requireFailed(const char* reason);
+
+// Inline with the throw out of line: a call per check of every packet and draw otherwise.
+[[gnu::always_inline]] inline void require(bool condition, const char* reason) {
+    if (!condition) [[unlikely]] requireFailed(reason);
+}
 
 std::uint32_t readRegister(const Registers& registers, std::uint32_t offset);
 
