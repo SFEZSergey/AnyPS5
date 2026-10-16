@@ -62,7 +62,10 @@ private:
     // Who sleeps on the condition variables (under `mutex`): a notify is a futex syscall per draw
     // otherwise, a tenth of the recorder's time.
     bool recorderWaiting = false;
-    int workerWaiting = 0;
+    // The worker waits either for room (a full queue: woken once half of it is recorded, not at
+    // every job) or for the queue to empty (a drain).
+    bool waitingForRoom = false;
+    bool waitingForDrain = false;
     std::exception_ptr failure;
     std::thread thread;
 

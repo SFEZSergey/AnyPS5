@@ -67,7 +67,7 @@ void DrawPipeline::run() {
         running.clear();
         if (error != nullptr && failure == nullptr) failure = error;
         pending.fetch_sub(1, std::memory_order_acq_rel);
-        if (workerWaiting != 0) done.notify_all();
+        if ((waitingForRoom && jobs.size() <= MaxQueuedJobs / 2) || (waitingForDrain && jobs.empty()) || failure != nullptr) done.notify_all();
     }
 }
 
@@ -76,9 +76,9 @@ void DrawPipeline::Enqueue(Job job) {
     if (failure != nullptr) std::rethrow_exception(failure);
     if (jobs.size() >= MaxQueuedJobs) {
         const auto start = Profiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        ++workerWaiting;
-        done.wait(lock, [&] { return jobs.size() < MaxQueuedJobs || failure != nullptr; });
-        --workerWaiting;
+        waitingForRoom = true;
+        done.wait(lock, [&] { return jobs.size() <= MaxQueuedJobs / 2 || failure != nullptr; });
+        waitingForRoom = false;
         if (failure != nullptr) std::rethrow_exception(failure);
         if (Profiled()) {
             ++fullWaits;
@@ -99,9 +99,9 @@ void DrawPipeline::Drain(const char* reason) {
     ++drains;
     if (pending.load(std::memory_order_acquire) != 0) {
         const auto start = Profiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        ++workerWaiting;
+        waitingForDrain = true;
         done.wait(lock, [&] { return pending.load(std::memory_order_acquire) == 0; });
-        --workerWaiting;
+        waitingForDrain = false;
         if (Profiled()) {
             ++drainsWaited;
             drainWaitMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
