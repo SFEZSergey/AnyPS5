@@ -41,7 +41,9 @@ void Driver::execute(const Submission& submission) {
         }
         ~FlipHold() { Release(); }
     } flipHold{*this, submission.holdsFlip};
+    auto* pipeline = drawPipeline(submission.queue);
     if (submission.suspend) {
+        if (pipeline != nullptr) pipeline->Drain("suspend");
         PerformanceContext timingContext(submissionTiming);
         PerformanceTimer timing("Driver.Suspend");
 
@@ -123,6 +125,14 @@ void Driver::execute(const Submission& submission) {
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
         auto nextCursor = cursor + count;
+        // Draw pipeline: register writes and plain draws go on while the recorder works; anything
+        // else (labels, waits, dispatches, copies, flips, predication) sees every queued draw recorded.
+        if (pipeline != nullptr && !pipeline->Idle()) {
+            const bool plainDraw = Pm4::DrawOpcode(opcode) && !Pm4::IndirectDrawOpcode(opcode);
+            const bool stateOnly = Pm4::IndirectRegisterOpcode(opcode) || (!Pm4::AccessesMemory(header) && opcode != 0x15 && opcode != 0x42 && opcode != 0x46 && opcode != 0x58 && header != FlipPacketHeader && header != RenderingWaitPacketHeader);
+            const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
+            if (predicated || !(plainDraw || stateOnly)) pipeline->Drain(header == FlipPacketHeader ? "flip" : opcode == 0x15 || opcode == 0x16 ? "dispatch" : opcode == 0x49 || opcode == 0x37 ? "label" : opcode == 0x3c || opcode == 0x93 || header == RenderingWaitPacketHeader ? "wait" : predicated ? "predication" : Pm4::IndirectDrawOpcode(opcode) ? "indirect draw" : "other packet");
+        }
         if (APS5_ENABLE_TIMING_LOG && submission.queue == 0 && pendingFrameTiming == nullptr) includeTimingSubmission(submission, false);
         PerformanceContext timingContext(submission.queue == 0 ? pendingFrameTiming.get() : FrameTiming::Async());
         PerformanceTimer timing("Driver.Packet");
@@ -259,6 +269,7 @@ void Driver::execute(const Submission& submission) {
                 }
             }
         } else if (drawPacket) {
+            if (pipeline != nullptr && !pendingWaits().empty()) pipeline->Drain("pending wait");
             landPendingWaits(submission.queue);
             bool drawn = false;
             timed(&WorkerProfile::drawMs, [&] {
@@ -308,13 +319,16 @@ void Driver::execute(const Submission& submission) {
             }
             if (endOfPipeInterrupt && !interruptDeferred) AgcDriverDeliverEopInterrupt(submission.queue);
         }
-        if (drawPacket || (sampleDump && wroteOnGpu)) Graphics::Recorder::CountRecordedWork();
+        // A draw handed to the pipeline is counted by the recorder once recorded.
+        if ((drawPacket && !drawQueued()) || (sampleDump && wroteOnGpu)) Graphics::Recorder::CountRecordedWork();
+        drawQueued() = false;
         timing.Mark(header == RenderingWaitPacketHeader ? "rendering_wait" : opcode == 0x3c || opcode == 0x93 ? "memory_wait" : opcode == 0x15 || opcode == 0x16 ? "dispatch" : drawPacket ? "draw" : "execute");
         if (submission.queue == 0) timing.FinishPacket(submission.serial, cursor, opcode, count);
         else timing.Finish();
         cursor = nextCursor;
     }
 
+    if (pipeline != nullptr) pipeline->Drain("end of submission");
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");
     static const bool submitAtEnd = std::getenv("APS5_SUBMIT_AT_END") != nullptr;

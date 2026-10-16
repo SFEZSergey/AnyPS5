@@ -8,6 +8,10 @@
 namespace AgcDriver::DriverDetail {
 
 void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool labelPacket) {
+    // While the draw pipeline records, it holds the GPU mutex and submits full batches itself: the
+    // flushes here only try the mutex instead of waiting for it.
+    const auto* pipeline = drawPipeline(queue);
+    const bool pipelineBusy = pipeline != nullptr && !pipeline->Idle();
     static const bool packetFlush = !LabelBatchSubmit() && std::getenv("APS5_NO_LABEL_PACKET_FLUSH") == nullptr;
     static const bool ownLock = std::getenv("APS5_LABEL_OWN_LOCK") != nullptr;
     static std::atomic<std::uint64_t> packetFlushes{0}, deadlineFlushes{0}, capFlushes{0}, boundaryReaps{0}, overdueLocks{0};
@@ -43,7 +47,7 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
         if (now - *pending >= labelFlushDeadline()) submit = pendingDue = true;
     }
     const auto work = Graphics::Recorder::RecordedWorkSinceSubmit();
-    const bool capped = !submit && !record && batchCap() != 0 && work >= batchCap();
+    const bool capped = !pipelineBusy && !submit && !record && batchCap() != 0 && work >= batchCap();
     const bool reap = !submit && !record && !capped && reapDue && (reapEachPacket() || now - lastReapTry >= ReapInterval);
     if (!submit && !record && !capped && !reap) {
         if (recordAtLock) ++recordTriesSkipped;
@@ -64,6 +68,7 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
     } else if (deferredDue || (queue == 0 && (capped || (submit && (!selfLocking || pendingDue))))) {
         outright = true;
     }
+    if (pipelineBusy) outright = false;
     if (outright) {
         gpuLock.lock();
     } else if (!gpuLock.try_lock()) {

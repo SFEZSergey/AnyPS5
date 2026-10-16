@@ -1210,6 +1210,10 @@ std::uint64_t CollectEpoch() {
     return collectMemoEnabled() ? threadCollectEpoch : 0;
 }
 
+void AdoptCollectEpoch(std::uint64_t epoch) {
+    threadCollectEpoch = epoch;
+}
+
 namespace {
 
 bool importTrackerActive();

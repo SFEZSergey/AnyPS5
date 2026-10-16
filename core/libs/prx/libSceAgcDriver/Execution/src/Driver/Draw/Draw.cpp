@@ -3,6 +3,9 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <cstdlib>
 
@@ -41,6 +44,28 @@ struct DrawScratch {
     }
 };
 
+// Scratch sets handed to the draw pipeline come back here once the recorder is done with them.
+struct ScratchRecycle {
+    std::mutex mutex;
+    std::vector<std::unique_ptr<DrawScratch>> spare;
+    static ScratchRecycle& Get() {
+        static ScratchRecycle recycle;
+        return recycle;
+    }
+    std::unique_ptr<DrawScratch> Take() {
+        std::lock_guard lock(mutex);
+        if (spare.empty()) return std::make_unique<DrawScratch>();
+        auto scratch = std::move(spare.back());
+        spare.pop_back();
+        return scratch;
+    }
+    void Give(std::unique_ptr<DrawScratch> scratch) {
+        scratch->Release();
+        std::lock_guard lock(mutex);
+        if (spare.size() < 64) spare.push_back(std::move(scratch));
+    }
+};
+
 struct DrawScratchLease {
     static bool Disabled() {
         static const bool disabled = std::getenv("APS5_NO_DRAW_SCRATCH") != nullptr;
@@ -59,8 +84,23 @@ struct DrawScratchLease {
         ++depth;
     }
     ~DrawScratchLease() {
+        if (scratch == nullptr) return;
         scratch->Release();
         if (!owned) --Depth();
+    }
+    // Hands the set to a pipelined draw: this nesting level gets a fresh one.
+    std::unique_ptr<DrawScratch> Detach() {
+        std::unique_ptr<DrawScratch> taken;
+        if (owned) {
+            taken = std::move(owned);
+        } else {
+            auto& slot = Pool()[Depth() - 1];
+            taken = std::move(slot);
+            slot = ScratchRecycle::Get().Take();
+            --Depth();
+        }
+        scratch = nullptr;
+        return taken;
     }
     DrawScratchLease(const DrawScratchLease&) = delete;
     DrawScratchLease& operator=(const DrawScratchLease&) = delete;
@@ -75,10 +115,60 @@ struct DrawScratchLease {
     DrawScratch* scratch = nullptr;
     std::unique_ptr<DrawScratch> owned;
 };
+
+// Guest memory a draw may write: storage buffers and its color and depth targets.
+void AppendDrawWrites(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages, std::vector<DrawPipeline::Range>& writes) {
+    for (const auto& stage : stages) {
+        if (stage.program != nullptr) Driver::AppendWrittenRanges(*stage.program, writes);
+    }
+    const auto target = [&](const Graphics::ColorTarget& color) {
+        if (color.address != 0 && color.bytes != 0) writes.emplace_back(color.address, color.address + color.bytes);
+    };
+    if (graphics.hasColorTarget) target(graphics.color);
+    for (const auto& color : graphics.colors) target(color);
+    if (graphics.depth) {
+        const auto bytes = static_cast<std::uint64_t>(graphics.depth->extent.width) * graphics.depth->extent.height * 4u;
+        if (graphics.depth->address != 0) writes.emplace_back(graphics.depth->address, graphics.depth->address + bytes);
+        if (graphics.depth->stencilAddress != 0) writes.emplace_back(graphics.depth->stencilAddress, graphics.depth->stencilAddress + bytes);
+    }
+}
+}
+
+DrawPipeline* Driver::drawPipeline(std::uint32_t queue) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_PIPELINE_DRAWS");
+        return value != nullptr && value[0] == '1' && std::getenv("APS5_LOCKED_DRAW_PREPARE") == nullptr && !DrawScratchLease::Disabled();
+    }();
+    if (!enabled || queue != 0) return nullptr;
+    thread_local std::unique_ptr<DrawPipeline> pipeline;
+    if (pipeline == nullptr) {
+        pipeline = std::make_unique<DrawPipeline>(queue, [queue] {
+            onWorkerThread() = true;
+            char role[32];
+            std::snprintf(role, sizeof role, "draw recorder 0x%x", queue);
+            PrioritizeWorkerThread(role);
+            GuestMemory::TagGpuLockThread(queue);
+            GuestMemory::SetCurrentPacket(0x27, queue);
+        });
+    }
+    return pipeline.get();
+}
+
+bool& Driver::drawQueued() {
+    static thread_local bool queued = false;
+    return queued;
+}
+
+void Driver::AppendWrittenRanges(const ShaderRecompiler::RecompileResult& compiled, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+    appendWrittenRanges(compiled, ranges);
 }
 
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected) {
-    const DrawScratchLease lease;
+    auto* pipeline = drawPipeline(submission.queue);
+    // Queued labels belong to this thread and are recorded under the GPU mutex in order with the
+    // draws: every earlier draw must be recorded first.
+    if (pipeline != nullptr && !deferredLabels().labels.empty()) pipeline->Drain("labels");
+    DrawScratchLease lease;
     auto& scratch = *lease.scratch;
     PerformanceTimer timing("Driver.Draw");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -371,6 +461,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         phaseTiming.Phase(DrawRowLabels);
     };
     if (drawParameters.indirect && indirectCpu) {
+        if (pipeline != nullptr) {
+            pipeline->Drain("indirect");
+            pipeline->NoteSyncDraw("indirect");
+        }
 
         const auto indirect = *drawParameters.indirect;
         // The records patch user data and re-materialize their programs: every program gets its own
@@ -463,6 +557,53 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (auto known = localDevice->KnownDrawRejection(graphics, stages)) {
             rejected = std::move(*known);
             return DrawVerdict::Rejected;
+        }
+    }
+    if (pipeline != nullptr && !gpuLock.owns_lock()) {
+        if (!deferredLabels().labels.empty()) {
+            pipeline->Drain("labels");
+            pipeline->NoteSyncDraw("labels");
+        } else if (pipeline->Overlaps(memory)) {
+            // The capture read memory a queued draw writes: capture again once it is recorded.
+            pipeline->Drain("overlap");
+            pipeline->NoteSyncDraw("overlap");
+            return draw(queue, packet, submission, rejected);
+        } else {
+            DrawPipeline::Job job;
+            AppendDrawWrites(graphics, stages, job.writes);
+            std::shared_ptr<DrawScratch> owned(lease.Detach().release(), [](DrawScratch* released) { ScratchRecycle::Get().Give(std::unique_ptr<DrawScratch>(released)); });
+            job.work = [this, owned = std::move(owned), decode, entry, localDevice, geometryHeld, recipe, drawParameters, drawKey, queueId = submission.queue, epoch = GuestMemory::CollectEpoch()]() mutable {
+                auto& work = *owned;
+                GuestMemory::AdoptCollectEpoch(epoch);
+                const auto& state = decode->state;
+                std::unique_lock lock(GuestMemory::GpuMutex(), std::defer_lock);
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+                lock.lock();
+                if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
+                recordLabelsForPacket(localDevice.get(), queueId);
+                noteDrawWriters(work.stages, queueId);
+                // Counted once recorded; a full batch is submitted here, under the mutex already held.
+                const auto recorded = [&] {
+                    Graphics::Recorder::CountRecordedWork();
+                    if (batchCap() != 0 && Graphics::Recorder::RecordedWorkSinceSubmit() >= batchCap()) localDevice->SubmitRecorded(queueId == 0);
+                };
+                if (recipe != nullptr) {
+                    if (localDevice->DrawFromRecipe(state, drawParameters, work.stages, work.snapshots, recipe) == RecipeOutcome::Recorded) {
+                        recorded();
+                        return;
+                    }
+                    VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
+                }
+                std::shared_ptr<const DrawRecipe> built;
+                localDevice->Draw(state, drawParameters, work.stages, work.snapshots, work.recipeStages.empty() ? nullptr : &built);
+                recorded();
+                lock.unlock();
+                if (built != nullptr) attachDrawRecipe(drawKey, work.recipeStages, std::move(built));
+            };
+            pipeline->Enqueue(std::move(job));
+            drawQueued() = true;
+            timing.Mark("draw_queued");
+            return drawn();
         }
     }
     lockForDraw();

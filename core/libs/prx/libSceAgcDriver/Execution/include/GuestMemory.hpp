@@ -99,6 +99,9 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
 // workers bump before every packet as before. CollectEpochBumps counts the bumps ([guestmem] line).
 void BumpCollectEpoch();
 std::uint64_t CollectEpoch();
+// The draw pipeline's recorder works in the epoch the queue worker prepared the draw in: its collects
+// are memoized exactly as the worker's would have been (0: a fresh epoch for every collect).
+void AdoptCollectEpoch(std::uint64_t epoch);
 std::uint64_t CollectEpochBumps();
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
 // The tracker's current generation (every collect and MarkWritten bumps it): a stamp taken after
