@@ -1,8 +1,29 @@
 #include "prx/libSceAgcDriver/Execution/include/PresentationScaler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AspectFit.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
 
 namespace AgcDriver {
+namespace {
+
+// Вписывание кадра в окно (APS5_SCALE_MODE): fit — целиком, с полосами; fill — на весь экран с
+// обрезкой краёв; stretch — растянуть без сохранения пропорций.
+enum class ScaleMode { Fit, Fill, Stretch };
+
+ScaleMode PresentScaleMode() {
+    static const ScaleMode mode = [] {
+        const char* value = std::getenv("APS5_SCALE_MODE");
+        if (value != nullptr && std::strcmp(value, "fill") == 0) return ScaleMode::Fill;
+        if (value != nullptr && std::strcmp(value, "stretch") == 0) return ScaleMode::Stretch;
+        return ScaleMode::Fit;
+    }();
+    return mode;
+}
+
+}
 
 PresentationScaler::PresentationScaler(const Graphics::Context& context, VkFormat sourceFormat, VkFormat destinationFormat) : context(context), sourceFormat(sourceFormat) {
     Graphics::Require(context.formatProperties != nullptr, "missing Vulkan format property resolver");
@@ -144,14 +165,28 @@ void PresentationScaler::RecordBlit(VkCommandBuffer commands, VkImage destinatio
 
 void PresentationScaler::RecordBlitFrom(const Graphics::Context& context, VkCommandBuffer commands, VkImage image, VkImageLayout layout, std::uint32_t width, std::uint32_t height, VkFilter filter, VkImage destinationImage, std::uint32_t destinationWidth, std::uint32_t destinationHeight) {
     Graphics::Require(image != VK_NULL_HANDLE && width != 0 && height != 0, "presentation blit source is unavailable");
-    const auto rect = ComputeContainRect_nid_postfix(width, height, destinationWidth, destinationHeight);
     VkImageBlit blit{};
     blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     blit.srcOffsets[0] = {0, 0, 0};
     blit.srcOffsets[1] = {static_cast<std::int32_t>(width), static_cast<std::int32_t>(height), 1};
     blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    blit.dstOffsets[0] = {rect.x, rect.y, 0};
-    blit.dstOffsets[1] = {rect.x + static_cast<std::int32_t>(rect.width), rect.y + static_cast<std::int32_t>(rect.height), 1};
+    blit.dstOffsets[0] = {0, 0, 0};
+    blit.dstOffsets[1] = {static_cast<std::int32_t>(destinationWidth), static_cast<std::int32_t>(destinationHeight), 1};
+    const auto mode = PresentScaleMode();
+    if (mode == ScaleMode::Fit) {
+        const auto rect = ComputeContainRect_nid_postfix(width, height, destinationWidth, destinationHeight);
+        blit.dstOffsets[0] = {rect.x, rect.y, 0};
+        blit.dstOffsets[1] = {rect.x + static_cast<std::int32_t>(rect.width), rect.y + static_cast<std::int32_t>(rect.height), 1};
+    } else if (mode == ScaleMode::Fill) {
+        // Видимая часть кадра — центр с пропорциями окна.
+        const double scale = std::max(static_cast<double>(destinationWidth) / width, static_cast<double>(destinationHeight) / height);
+        const auto visibleWidth = std::clamp<std::int32_t>(static_cast<std::int32_t>(std::lround(destinationWidth / scale)), 1, static_cast<std::int32_t>(width));
+        const auto visibleHeight = std::clamp<std::int32_t>(static_cast<std::int32_t>(std::lround(destinationHeight / scale)), 1, static_cast<std::int32_t>(height));
+        const auto x = (static_cast<std::int32_t>(width) - visibleWidth) / 2;
+        const auto y = (static_cast<std::int32_t>(height) - visibleHeight) / 2;
+        blit.srcOffsets[0] = {x, y, 0};
+        blit.srcOffsets[1] = {x + visibleWidth, y + visibleHeight, 1};
+    }
     context.Function<PFN_vkCmdBlitImage>("vkCmdBlitImage")(commands, image, layout, destinationImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, filter);
 }
 

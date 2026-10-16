@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <atomic>
+#include <cstring>
 #include <cmath>
 #include <bit>
 #include <chrono>
@@ -87,6 +89,32 @@ VkSurfaceKHR createWindowSurface(void* context, VkInstance instance) {
     return surface;
 }
 
+// Высота последнего кадра игры: от неё «авто» выбирает размер вывода.
+std::atomic<std::uint32_t> contentHeight{0};
+
+#ifdef __ANDROID__
+// Размер swapchain на Android (APS5_OUTPUT_RES): auto — пропорции экрана, но не выше кадра игры (до
+// него дотягивает аппаратный масштабатор дисплея, GPU не рисует лишние пиксели); native — полное
+// разрешение панели; число — высота в пикселях.
+void fitOutputToContent(std::uint32_t& width, std::uint32_t& height) {
+    static const std::uint32_t fixed = [] {
+        const char* value = std::getenv("APS5_OUTPUT_RES");
+        if (value == nullptr || value[0] == '\0' || std::strcmp(value, "auto") == 0) return 0u;
+        if (std::strcmp(value, "native") == 0) return std::numeric_limits<std::uint32_t>::max();
+        const long rows = std::strtol(value, nullptr, 10);
+        return rows >= 240 && rows <= 4320 ? static_cast<std::uint32_t>(rows) : 0u;
+    }();
+    if (width == 0 || height == 0 || fixed == std::numeric_limits<std::uint32_t>::max()) return;
+    std::uint32_t target = fixed != 0 ? fixed : contentHeight.load(std::memory_order_relaxed);
+    if (target == 0) target = VIDEO_OUT_DEFAULT_HEIGHT;
+    const auto shorter = std::min(width, height);
+    if (shorter <= target) return;
+    const double scale = static_cast<double>(target) / static_cast<double>(shorter);
+    width = std::max<std::uint32_t>(2, static_cast<std::uint32_t>(std::lround(width * scale / 2.0)) * 2);
+    height = std::max<std::uint32_t>(2, static_cast<std::uint32_t>(std::lround(height * scale / 2.0)) * 2);
+}
+#endif
+
 void windowDrawableSize(void* context, std::uint32_t* width, std::uint32_t* height) {
     if ((SDL_GetWindowFlags(static_cast<SDL_Window*>(context)) & SDL_WINDOW_MINIMIZED) != 0) {
         *width = 0;
@@ -98,6 +126,9 @@ void windowDrawableSize(void* context, std::uint32_t* width, std::uint32_t* heig
     SDL_Vulkan_GetDrawableSize(static_cast<SDL_Window*>(context), &drawableWidth, &drawableHeight);
     *width = drawableWidth > 0 ? static_cast<std::uint32_t>(drawableWidth) : 0;
     *height = drawableHeight > 0 ? static_cast<std::uint32_t>(drawableHeight) : 0;
+#ifdef __ANDROID__
+    fitOutputToContent(*width, *height);
+#endif
 }
 
 void checkConfig(const VideoOutConfig& cfg) {
@@ -549,6 +580,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
             req.gpuComplete = true;
         }
     } else {
+        contentHeight.store(std::min(req.width, req.height), std::memory_order_relaxed);
         window.Ensure(req.width, req.height);
         const auto extensions = windowExtensions(window.Handle());
         const AgcDriver::PresentationWindow target{window.Handle(), extensions, &createWindowSurface, &windowDrawableSize, req.width, req.height, req.timing};
