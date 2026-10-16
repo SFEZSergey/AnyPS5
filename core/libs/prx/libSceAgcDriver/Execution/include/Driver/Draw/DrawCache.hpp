@@ -44,6 +44,10 @@ std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decod
 struct DrawRecipeRecord {
     std::vector<std::weak_ptr<const DispatchVariant>> stages;
     std::shared_ptr<const DrawRecipe> recipe;
+    // The stages' pipeline variant ids (the code, not the data): a draw whose variants differ only
+    // in data (ring-buffer addresses in the user data and the V#s) finds the recipe by its shape;
+    // the hit then proves the content key, the vertex input and the fragment outputs itself.
+    std::vector<std::uint64_t> shape;
     bool Matches(const std::vector<std::shared_ptr<DispatchVariant>>& variants) const;
     bool Expired() const;
 };

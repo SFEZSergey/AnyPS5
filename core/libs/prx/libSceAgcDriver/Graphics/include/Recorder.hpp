@@ -515,7 +515,34 @@ private:
         VkFence fence = VK_NULL_HANDLE;
         std::vector<std::shared_ptr<void>> kept;
         std::size_t keptBytes = 0;
-        std::unordered_set<const void*> keptOwners;
+        // Owners whose bytes are counted (each once): an open-addressing set, one allocation per
+        // growth instead of one node per insert (KeepBytes runs for every recorded draw).
+        struct OwnerSet {
+            std::vector<const void*> slots;
+            std::size_t count = 0;
+            bool insert(const void* owner) {
+                if ((count + 1) * 2 > slots.size()) grow();
+                auto mask = slots.size() - 1;
+                auto index = (reinterpret_cast<std::uintptr_t>(owner) >> 4u) * 0x9e3779b97f4a7c15ull >> 32u;
+                for (;; ++index) {
+                    auto& slot = slots[index & mask];
+                    if (slot == owner) return false;
+                    if (slot == nullptr) {
+                        slot = owner;
+                        ++count;
+                        return true;
+                    }
+                }
+            }
+            void grow() {
+                std::vector<const void*> old(slots.size() < 32 ? 64 : slots.size() * 2, nullptr);
+                old.swap(slots);
+                count = 0;
+                for (const auto* owner : old) {
+                    if (owner != nullptr) insert(owner);
+                }
+            }
+        } keptOwners;
         std::vector<std::function<void()>> completions;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         std::vector<std::uint64_t> writeNotes;

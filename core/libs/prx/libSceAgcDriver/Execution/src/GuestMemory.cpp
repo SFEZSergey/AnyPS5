@@ -45,6 +45,7 @@ extern "C" void Aps5WatchTraceSource(const char* source);
 #include <pthread.h>
 #include <sstream>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #if __has_include(<linux/fs.h>)
 #include <linux/fs.h>
@@ -601,6 +602,25 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
         if (!emit(PageRun{cursor, next, readable, writable})) return true;
         cursor = next;
 #else
+        // Pages the write watch protects to catch the guest's stores show up read-only in the maps:
+        // their protection for everything here is the watch's record (a storage texture over them
+        // is still writable memory). A read-only run is split by that record; -1 (not watched) keeps
+        // what the maps say.
+        const auto forLogical = [](std::uintptr_t from, std::uintptr_t to, bool readable, bool writable, auto&& visit) -> bool {
+            if (!readable || writable) return visit(from, to, readable, writable);
+            auto at = from;
+            while (at < to) {
+                std::uintptr_t runEnd = to;
+                const int protection = GuestWriteWatch::GuestWriteWatchProtection_nid_postfix(at, to, &runEnd);
+                if (runEnd <= at || runEnd > to) runEnd = to;
+                const bool logicalReadable = protection >= 0 ? (protection & PROT_READ) != 0 : readable;
+                const bool logicalWritable = protection >= 0 && logicalReadable && (protection & PROT_WRITE) != 0;
+                if (!visit(at, runEnd, logicalReadable, logicalWritable)) return false;
+                at = runEnd;
+            }
+            return true;
+        };
+        const auto emitRun = [&](std::uintptr_t from, std::uintptr_t to, bool readable, bool writable) { return emit(PageRun{from, to, readable, writable}); };
         if (const int fd = ProcMapsQueryFd(); fd >= 0) {
             procmap_query query{};
             query.size = sizeof(query);
@@ -616,7 +636,7 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
                 }
                 const bool readable = (query.vma_flags & PROCMAP_QUERY_VMA_READABLE) != 0;
                 const auto next = std::min<std::uintptr_t>(end, query.vma_end);
-                if (!emit(PageRun{cursor, next, readable, readable && (query.vma_flags & PROCMAP_QUERY_VMA_WRITABLE) != 0})) return true;
+                if (!forLogical(cursor, next, readable, readable && (query.vma_flags & PROCMAP_QUERY_VMA_WRITABLE) != 0, emitRun)) return true;
                 cursor = next;
                 continue;
             }
@@ -661,9 +681,14 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
                 found = true;
                 break;
             }
-            remember(first, last, permissions[0] == 'r', permissions[0] == 'r' && permissions[1] == 'w');
+            const bool mapReadable = permissions[0] == 'r';
+            const bool mapWritable = mapReadable && permissions[1] == 'w';
+            static_cast<void>(forLogical(first, last, mapReadable, mapWritable, [&](std::uintptr_t from, std::uintptr_t to, bool readable, bool writable) {
+                remember(from, to, readable, writable);
+                return true;
+            }));
             const auto next = std::min(end, last);
-            if (!emit(PageRun{cursor, next, permissions[0] == 'r', permissions[0] == 'r' && permissions[1] == 'w'})) return true;
+            if (!forLogical(cursor, next, mapReadable, mapWritable, emitRun)) return true;
             cursor = next;
             found = true;
             break;

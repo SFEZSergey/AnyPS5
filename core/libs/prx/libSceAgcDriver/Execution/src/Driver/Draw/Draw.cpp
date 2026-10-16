@@ -35,12 +35,13 @@ struct DrawScratch {
     std::vector<std::size_t> resultIndex;
     std::vector<Graphics::GuestMemorySnapshot> snapshots;
     std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
+    std::vector<std::uint64_t> recipeShape;
 
     void Release() {
         programs.clear(); memory.clear(); linked.clear(); vertexInfos.clear(); decodeReads.clear();
         results.clear(); stages.clear(); programResults.clear(); heldResults.clear(); stageCaptures.clear();
         matched.clear(); matchedRegions.clear(); fresh.clear(); recompiled.clear(); pushOffsets.clear();
-        resultIndex.clear(); snapshots.clear(); recipeStages.clear();
+        resultIndex.clear(); snapshots.clear(); recipeStages.clear(); recipeShape.clear();
     }
 };
 
@@ -152,6 +153,13 @@ DrawPipeline* Driver::drawPipeline(std::uint32_t queue) {
         });
     }
     return pipeline.get();
+}
+
+// Recipes found by the stages' pipeline variant ids when the variants differ in data only
+// (DrawRecipeRecord::shape). APS5_NO_SHAPE_RECIPES=1: exact variants only, as before.
+bool ShapeRecipes() {
+    static const bool off = std::getenv("APS5_NO_SHAPE_RECIPES") != nullptr;
+    return !off;
 }
 
 bool& Driver::drawQueued() {
@@ -400,7 +408,23 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         pushCursorBytes += static_cast<std::uint32_t>(result.pushConstants.size());
     }
 
-    cacheDrawStages(useDrawEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, fresh, drawKey, registerKey, decode, phaseTiming);
+    // The draw's shape: its stages' pipeline variant ids (all known, else none), see DrawRecipeRecord.
+    // A miss whose shape already has a recipe needs no fresh variants: they would only push older
+    // ones out of the entry and be thrown away in turn (every menu draw differs in its data).
+    auto& recipeShape = scratch.recipeShape;
+    std::shared_ptr<const DrawRecipe> shapeRecipe;
+    if (registerKey && !drawParameters.indirect && Graphics::DrawRecipes() && ShapeRecipes()) {
+        for (const auto* result : programResults) {
+            const auto id = result != nullptr ? result->PipelineVariantId() : 0;
+            if (id == 0) {
+                recipeShape.clear();
+                break;
+            }
+            recipeShape.push_back(id);
+        }
+        if (!drawHit && !recipeShape.empty()) shapeRecipe = findDrawRecipe(drawKey, {}, recipeShape);
+    }
+    cacheDrawStages(useDrawEntries && shapeRecipe == nullptr, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, fresh, drawKey, registerKey, decode, phaseTiming);
     timing.Mark("shader_compile_and_link");
 
     for (const auto& reads : decodeReads) {
@@ -548,9 +572,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         for (std::size_t i = 0; i < programs.size(); ++i) recipeStages.push_back(drawHit ? matched[i] : fresh[i]);
         if (std::all_of(recipeStages.begin(), recipeStages.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant == nullptr; })) recipeStages.clear();
     }
-    std::shared_ptr<const DrawRecipe> recipe;
-    if (drawHit && !recipeStages.empty()) {
-        recipe = findDrawRecipe(drawKey, recipeStages);
+    std::shared_ptr<const DrawRecipe> recipe = shapeRecipe;
+    if (recipe == nullptr && !recipeStages.empty() && (drawHit || !recipeShape.empty())) {
+        recipe = findDrawRecipe(drawKey, recipeStages, recipeShape);
         if (recipe == nullptr) VulkanDevice::NoteDrawRecipeMiss(VulkanDevice::DrawRecipePrecheck::NoRecipe);
     }
     if (recipe == nullptr) {
@@ -598,7 +622,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 localDevice->Draw(state, drawParameters, work.stages, work.snapshots, work.recipeStages.empty() ? nullptr : &built);
                 recorded();
                 lock.unlock();
-                if (built != nullptr) attachDrawRecipe(drawKey, work.recipeStages, std::move(built));
+                if (built != nullptr) attachDrawRecipe(drawKey, work.recipeStages, work.recipeShape, std::move(built));
             };
             pipeline->Enqueue(std::move(job));
             drawQueued() = true;
@@ -621,7 +645,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::shared_ptr<const DrawRecipe> built;
     localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built);
     phaseTiming.Phase(DrawRowGraphics);
-    if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
+    if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, recipeShape, std::move(built));
     timing.Mark("draw_and_resource_release");
     return drawn();
 }

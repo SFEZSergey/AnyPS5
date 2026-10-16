@@ -2455,7 +2455,7 @@ void Recorder::Keep(std::shared_ptr<void> object, std::size_t bytes) {
 void Recorder::KeepBytes(const void* owner, std::size_t bytes) {
     if (owner == nullptr || bytes == 0) return;
     ensureOpen();
-    if (open->keptOwners.insert(owner).second) open->keptBytes += bytes;
+    if (open->keptOwners.insert(owner)) open->keptBytes += bytes;
 }
 
 void Recorder::BoundKeptBytes() {

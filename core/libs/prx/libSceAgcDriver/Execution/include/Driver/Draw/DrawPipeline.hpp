@@ -59,6 +59,10 @@ private:
     std::vector<Range> running;
     std::atomic<std::uint64_t> pending{0};
     bool stopping = false;
+    // Who sleeps on the condition variables (under `mutex`): a notify is a futex syscall per draw
+    // otherwise, a tenth of the recorder's time.
+    bool recorderWaiting = false;
+    int workerWaiting = 0;
     std::exception_ptr failure;
     std::thread thread;
 

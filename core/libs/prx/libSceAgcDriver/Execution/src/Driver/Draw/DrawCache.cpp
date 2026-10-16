@@ -124,7 +124,7 @@ bool DecodeProgramsCurrent(const DrawDecode& decode, const ShaderRegistry&) {
     });
 }
 
-std::shared_ptr<const DrawRecipe> Driver::findDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages) {
+std::shared_ptr<const DrawRecipe> Driver::findDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, const std::vector<std::uint64_t>& shape) {
     std::shared_ptr<const std::vector<DrawRecipeRecord>> records;
     {
         std::lock_guard cacheLock(drawCacheMutex);
@@ -136,10 +136,15 @@ std::shared_ptr<const DrawRecipe> Driver::findDrawRecipe(std::uint64_t key, cons
     for (const auto& record : *records) {
         if (record.Matches(stages)) return record.recipe;
     }
+    if (!shape.empty()) {
+        for (const auto& record : *records) {
+            if (record.shape == shape) return record.recipe;
+        }
+    }
     return nullptr;
 }
 
-void Driver::attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::shared_ptr<const DrawRecipe> recipe) {
+void Driver::attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, const std::vector<std::uint64_t>& shape, std::shared_ptr<const DrawRecipe> recipe) {
     std::shared_ptr<DrawEntry> entry;
     {
         std::lock_guard cacheLock(drawCacheMutex);
@@ -149,10 +154,11 @@ void Driver::attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_p
     }
     const auto old = entry->recipes.load();
     auto records = std::make_shared<std::vector<DrawRecipeRecord>>();
-    records->push_back({std::vector<std::weak_ptr<const DispatchVariant>>(stages.begin(), stages.end()), std::move(recipe)});
+    records->push_back({std::vector<std::weak_ptr<const DispatchVariant>>(stages.begin(), stages.end()), std::move(recipe), shape});
     if (old != nullptr) {
         for (const auto& record : *old) {
-            if (record.Matches(stages) || record.Expired() || records->size() >= dispatchVariants()) continue;
+            // A record of the same shape is replaced (its recipe is the older one of the two).
+            if (record.Matches(stages) || (!shape.empty() && record.shape == shape) || (record.Expired() && record.shape.empty()) || records->size() >= dispatchVariants()) continue;
             records->push_back(record);
         }
     }

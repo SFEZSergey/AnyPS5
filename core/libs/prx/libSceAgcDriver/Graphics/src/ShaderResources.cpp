@@ -1302,7 +1302,20 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
     try {
         Require(!shaders.empty() && context.limits.maxBoundDescriptorSets >= 1, "shader descriptor set exceeds device limits");
         if (shaders.size() == 1u) refreshResourceKey = ContentKey(shaders.front(), false, true);
-        std::set<std::uint32_t> occupied;
+        // Working sets reused on this thread (cleared, capacity kept); the members get their final
+        // size up front instead of growing one element at a time.
+        thread_local std::vector<std::uint32_t> occupied;
+        thread_local std::vector<std::size_t> offsetsInData;
+        occupied.clear();
+        {
+            std::size_t total = 0;
+            for (const auto& shader : shaders) {
+                if (shader.program != nullptr) total += shader.program->bindings.size();
+            }
+            bindings.reserve(bindings.size() + total);
+            allocations.reserve(allocations.size() + total);
+            layoutKey.reserve(layoutKey.size() + total * 4 + 1);
+        }
         for (const auto& shader : shaders) {
             Require(shader.program != nullptr, "missing compiled shader");
             ShaderRecompiler::RuntimeAbi::RequireVersion(shader.program->runtimeAbiVersion);
@@ -1310,7 +1323,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
             std::uint64_t stageStorageBuffers = 0;
             std::uint64_t stageResources = shader.stage == ShaderRecompiler::ShaderStage::Fragment ? colorAttachments : 0;
             Require(stageResources <= context.limits.maxPerStageResources, "shader descriptors exceed per-stage limits");
-            std::vector<std::size_t> offsetsInData;
+            offsetsInData.clear();
             std::int64_t shaderData = -1;
             const auto firstSampler = samplers.size();
             const auto firstDeferred = deferredImages.size();
@@ -1322,7 +1335,8 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
             };
             for (const auto& binding : shader.program->bindings) {
                 Require(binding.descriptorSet == 0, "unexpected descriptor set: every shader resource must use descriptor set zero");
-                Require(occupied.insert(binding.binding).second, "duplicate shader binding");
+                Require(std::find(occupied.begin(), occupied.end(), binding.binding) == occupied.end(), "duplicate shader binding");
+                occupied.push_back(binding.binding);
                 const bool addressRole = binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer;
                 const bool bufferRole = addressRole || binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers || binding.role == ShaderRecompiler::DescriptorRole::ShaderData || binding.role == ShaderRecompiler::DescriptorRole::FlattenedSrt || binding.role == ShaderRecompiler::DescriptorRole::Gds;
                 const bool imageRole = binding.role == ShaderRecompiler::DescriptorRole::GuestImages || binding.role == ShaderRecompiler::DescriptorRole::GuestSamplers;
@@ -1398,7 +1412,8 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
         if (drawBuild && !usesBda && std::all_of(allocations.begin(), allocations.end(), [&](const Allocation& allocation) { return !allocation.guest || allocation.pushByte >= 0 || (allocation.dataAllocation >= 0 && allocation.dataByte < allocations[static_cast<std::size_t>(allocation.dataAllocation)].size); })) guestMemory.AllowAdjustedRegions();
         guestMemory.UploadPrepare(usesBda);
         timing.uploadMs = phase(BuildPhase::Upload);
-        std::vector<VkDescriptorSetLayoutBinding> description;
+        thread_local std::vector<VkDescriptorSetLayoutBinding> description;
+        description.clear();
         for (const auto& binding : bindings) {
             description.push_back(binding.layout);
             layoutKey.insert(layoutKey.end(), {binding.layout.binding, static_cast<std::uint32_t>(binding.layout.descriptorType), binding.layout.descriptorCount, binding.layout.stageFlags});
@@ -1416,7 +1431,8 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
         if (!bindings.empty()) {
             // The set is sized from the plan: every image element becomes exactly one descriptor
             // when stage B looks it up.
-            std::vector<VkDescriptorPoolSize> sizes;
+            thread_local std::vector<VkDescriptorPoolSize> sizes;
+            sizes.clear();
             if (storageBuffers != 0) sizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, static_cast<std::uint32_t>(storageBuffers)});
             if (plannedSampledImages != 0) sizes.push_back({VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, plannedSampledImages});
             if (plannedStorageImages != 0) sizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, plannedStorageImages});
@@ -1604,10 +1620,25 @@ void ShaderResources::noteReusable() {
     captureValidation();
     reusable = false;
     directRegions.clear();
-    if (guestMemory.HasCopiedWrites() || HoldsLease() || usesBda || (bda != nullptr && LoopGuardEnabled())) return;
-    if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.size > MaxRefreshBytes; })) return;
+    // APS5_PROFILE_DRAW: why builds are not reusable ([reusable-why] every 10 s).
+    static const bool profileWhy = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static std::atomic<std::uint64_t> why[8]{};
+    const auto note = [&](int reason) {
+        if (!profileWhy) return;
+        ++why[reason];
+        static std::atomic<std::int64_t> last{0};
+        const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (now - last.load() < 10) return;
+        last = now;
+        std::fprintf(stderr, "[reusable-why] reusable %llu; not: copied writes %llu, lease %llu, bda %llu, big data %llu, region not direct %llu, no import serial %llu\n",
+            static_cast<unsigned long long>(why[0].exchange(0)), static_cast<unsigned long long>(why[1].exchange(0)), static_cast<unsigned long long>(why[2].exchange(0)), static_cast<unsigned long long>(why[3].exchange(0)), static_cast<unsigned long long>(why[4].exchange(0)), static_cast<unsigned long long>(why[5].exchange(0)), static_cast<unsigned long long>(why[6].exchange(0)));
+    };
+    if (guestMemory.HasCopiedWrites()) return note(1);
+    if (HoldsLease()) return note(2);
+    if (usesBda || (bda != nullptr && LoopGuardEnabled())) return note(3);
+    if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.size > MaxRefreshBytes; })) return note(4);
     const auto regions = guestMemory.DirectRegions();
-    if (!regions.has_value()) return;
+    if (!regions.has_value()) return note(5);
     for (const auto& [begin, end] : *regions) {
         // No reconcile here: the upload just took these imports, and the set is about to be recorded
         // against them.
@@ -1615,9 +1646,10 @@ void ShaderResources::noteReusable() {
         // Read-only image mirrors (exe ranges) are as stable as imports; their serials have the top
         // bit set, so the two spaces never collide.
         if (serial == 0) serial = ImageMirrorSerial(context, begin, static_cast<std::size_t>(end - begin));
-        if (serial == 0) return;
+        if (serial == 0) return note(6);
         directRegions.push_back({begin, end, serial});
     }
+    note(0);
     reusable = true;
 }
 
@@ -3399,7 +3431,8 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
     if (_set == VK_NULL_HANDLE || usesBda) return {};
-    const auto reads = guestMemory.InPlaceReads();
+    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+    guestMemory.InPlaceReadsInto(reads);
     auto result = std::make_shared<DrawBindings>();
     // Scratch reused across draws on this thread (cleared, never shrunk): a draw used to allocate
     // each of these afresh. Nothing below calls back into this function.
@@ -3530,7 +3563,9 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // The ranges this use reads in place through their host imports (read-only and written elements
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.
-    recorder.NotePendingReads(guestMemory.InPlaceReads(), guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement);
+    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> pendingReads;
+    guestMemory.InPlaceReadsInto(pendingReads);
+    recorder.NotePendingReads(pendingReads, guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement);
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
         if (storageWritten[index]) storageTextures[index]->MarkDirty();
@@ -3567,8 +3602,7 @@ void ShaderResources::WriteBackBuffers() {
 }
 
 bool ShaderResources::ReadsOverlap(std::uint64_t address, std::size_t bytes) const {
-    const auto reads = guestMemory.InPlaceReads();
-    return std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return address < range.second && range.first < address + bytes; });
+    return guestMemory.InPlaceReadOverlaps(address, bytes);
 }
 
 std::vector<std::pair<VkImage, bool>> ShaderResources::StorageImages() const {

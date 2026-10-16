@@ -866,6 +866,21 @@ bool DrawRecipes() {
     return !noDrawRecipe;
 }
 
+// Recipes for draws with a depth target (the hit checks the depth surface's view, see
+// DrawWithRecipe). APS5_NO_DEPTH_RECIPES=1: depth draws get none, as before.
+bool DepthRecipes() {
+    static const bool off = std::getenv("APS5_NO_DEPTH_RECIPES") != nullptr;
+    return !off;
+}
+
+// Recipes over a template whose read-only data buffers moved (ring-buffer data at new addresses,
+// the common case): the hit works the moved buffers out again, as a resource-cache hit does
+// (MovedReadOnlyBuffers). APS5_NO_MOVED_RECIPES=1: such draws get none, as before.
+bool MovedRecipes() {
+    static const bool off = std::getenv("APS5_NO_MOVED_RECIPES") != nullptr;
+    return !off;
+}
+
 const char* DrawRecipeMissName(DrawRecipeMiss miss) {
     constexpr std::array<const char*, static_cast<std::size_t>(DrawRecipeMiss::Count)> names{"none", "not recordable", "target gone", "template gone", "objects gone", "proof"};
     return names[static_cast<std::size_t>(miss)];
@@ -1106,12 +1121,26 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - inputs.maxIndex, "indexed draw vertex range overflow");
         inputs.maxIndex += draw.firstVertex;
     }
-    std::vector<VertexFetch> fetches;
-    std::vector<std::size_t> fetchValid;
-    fetches.reserve(attributes.size());
-    fetchValid.reserve(attributes.size());
-    std::vector<std::size_t> fetchOf(attributes.size(), 0);
-    std::vector<std::shared_ptr<Buffer>> zeroed(attributes.size());
+    // Per-draw working vectors, reused on this thread (cleared, capacity kept): the recorder made a
+    // dozen allocations here for every draw.
+    struct VertexScratch {
+        std::vector<VertexFetch> fetches, plannedFetches;
+        std::vector<std::size_t> fetchValid, fetchOf, plannedOf, order;
+        std::vector<std::shared_ptr<Buffer>> zeroed;
+        std::vector<bool> isSolo;
+        VertexCopyPlan plan;
+        std::vector<VkBuffer> rangeHandles, soloHandles;
+        std::vector<VkDeviceSize> rangeOffsets;
+    };
+    thread_local VertexScratch vertexScratch;
+    auto& fetches = vertexScratch.fetches;
+    auto& fetchValid = vertexScratch.fetchValid;
+    fetches.clear();
+    fetchValid.clear();
+    auto& fetchOf = vertexScratch.fetchOf;
+    fetchOf.assign(attributes.size(), 0);
+    auto& zeroed = vertexScratch.zeroed;
+    zeroed.assign(attributes.size(), nullptr);
     for (std::size_t i = 0; i < attributes.size(); ++i) {
         const auto& attribute = attributes[i];
         if (NullVertexDescriptor(attribute) || VertexFetchOutOfRange(attribute)) {
@@ -1130,21 +1159,24 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         fetchValid.push_back(args == nullptr && stride != 0 ? static_cast<std::size_t>(std::min(recordBytes, static_cast<std::uint64_t>(bytes))) : bytes);
     }
     const auto soloFetches = SoloZeroPaddedFetchIndices(fetches, fetchValid);
-    std::vector<bool> isSolo(fetches.size(), false);
+    auto& isSolo = vertexScratch.isSolo;
+    isSolo.assign(fetches.size(), false);
     for (const auto f : soloFetches) isSolo[f] = true;
-    std::vector<VertexFetch> plannedFetches;
-    plannedFetches.reserve(fetches.size());
-    std::vector<std::size_t> plannedOf(fetches.size(), 0);
+    auto& plannedFetches = vertexScratch.plannedFetches;
+    plannedFetches.clear();
+    auto& plannedOf = vertexScratch.plannedOf;
+    plannedOf.assign(fetches.size(), 0);
     for (std::size_t f = 0; f < fetches.size(); ++f) {
         if (isSolo[f]) continue;
         plannedOf[f] = plannedFetches.size();
         plannedFetches.push_back(fetches[f]);
     }
-    const auto plan = PlanVertexCopies(plannedFetches);
-    std::vector<VkBuffer> rangeHandles;
-    std::vector<VkDeviceSize> rangeOffsets;
-    rangeHandles.reserve(plan.copies.size());
-    rangeOffsets.reserve(plan.copies.size());
+    auto& plan = vertexScratch.plan;
+    PlanVertexCopiesInto(plannedFetches, plan, vertexScratch.order);
+    auto& rangeHandles = vertexScratch.rangeHandles;
+    auto& rangeOffsets = vertexScratch.rangeOffsets;
+    rangeHandles.clear();
+    rangeOffsets.clear();
     for (std::size_t range = 0; range < plan.copies.size(); ++range) {
         const auto [begin, end] = plan.copies[range];
         const auto bytes = static_cast<std::size_t>(end - begin);
@@ -1161,7 +1193,8 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         rangeOffsets.push_back(0);
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
     }
-    std::vector<VkBuffer> soloHandles(fetches.size(), VK_NULL_HANDLE);
+    auto& soloHandles = vertexScratch.soloHandles;
+    soloHandles.assign(fetches.size(), VK_NULL_HANDLE);
     for (const auto f : soloFetches) {
         const auto begin = fetches[f].begin;
         const auto bytes = static_cast<std::size_t>(fetches[f].end - begin);
@@ -2121,7 +2154,23 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         // only a template the resource cache serves under this content key (reusable: no lease,
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a
         // hit's proof is the template's ProveCurrent and nothing needs completion work.
-        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && !state.depth && resolved.moved.empty()) {
+        if (recipeOut != nullptr && DrawRecipes()) {
+            // APS5_PROFILE_DRAW: why recorded draws get no recipe ([recipe-why] every 10 s).
+            static const bool profileWhy = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+            if (profileWhy) {
+                static std::atomic<std::uint64_t> why[8]{};
+                static std::atomic<std::int64_t> lastWhy{0};
+                const int reason = !cacheable ? 1 : outcome.waited ? 2 : args != nullptr ? 3 : !resources->Reusable() ? 4 : (state.depth.has_value() && !DepthRecipes()) ? 5 : (!resolved.moved.empty() && !MovedRecipes()) ? 6 : 0;
+                ++why[reason];
+                const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                if (now - lastWhy.load() >= 10) {
+                    lastWhy = now;
+                    std::fprintf(stderr, "[recipe-why] built %llu; no recipe: not cacheable %llu, waited %llu, indirect %llu, not reusable %llu, depth target %llu, moved buffers %llu\n",
+                        static_cast<unsigned long long>(why[0].exchange(0)), static_cast<unsigned long long>(why[1].exchange(0)), static_cast<unsigned long long>(why[2].exchange(0)), static_cast<unsigned long long>(why[3].exchange(0)), static_cast<unsigned long long>(why[4].exchange(0)), static_cast<unsigned long long>(why[5].exchange(0)), static_cast<unsigned long long>(why[6].exchange(0)));
+                }
+            }
+        }
+        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && (!state.depth || DepthRecipes()) && (resolved.moved.empty() || MovedRecipes())) {
             auto recipe = std::make_shared<DrawRecipe>();
             recipe->device = context.device;
             recipe->templateRef = resources;
@@ -2419,11 +2468,30 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     Require(!draw.indirect, "a draw recipe covers direct draws only");
     auto* recorder = Recorder::Active();
     if (!RecordDraws() || recorder == nullptr || DumpTargetLimit() != 0) return miss(DrawRecipeMiss::NotRecordable);
-    Require(recipe.targets.size() == state.colors.size() && recipe.targetViews.size() == state.colors.size(), "draw recipe targets do not match the state");
-    auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, &recipe);
+    Require(recipe.targets.size() == state.colors.size(), "draw recipe targets do not match the state");
+    // A recipe made with a depth target ends its views with the depth surface's: the hit needs the
+    // same surface (DepthSurfaceView also applies a pending HTILE clear, as the ordinary path's call).
+    if (recipe.targetViews.size() != state.colors.size() + (state.depth ? 1u : 0u)) return miss(DrawRecipeMiss::TargetGone);
+    if (state.depth && DepthSurfaceView(context, *state.depth) != recipe.targetViews.back()) return miss(DrawRecipeMiss::TargetGone);
+    // The inputs are worked out for this draw (not taken from the recipe): a recipe found by the
+    // stages' shape (DrawRecipeRecord::shape) serves draws whose data differ, so the vertex input
+    // and the fragment outputs its pipeline was made for must be proved equal, as must the
+    // resources' content key (the template's fast proof stands on the descriptors being the ones
+    // it recorded; the read-only data that moved is worked out below).
+    auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr);
     if (inputs.nothing) {
         result.recorded = true;
         return result;
+    }
+    const auto sameLayout = [](const VertexInputLayout& a, const VertexInputLayout& b) {
+        return a.bindings.size() == b.bindings.size() && a.attributes.size() == b.attributes.size()
+            && std::equal(a.bindings.begin(), a.bindings.end(), b.bindings.begin(), [](const auto& x, const auto& y) { return std::memcmp(&x, &y, sizeof(x)) == 0; })
+            && std::equal(a.attributes.begin(), a.attributes.end(), b.attributes.begin(), [](const auto& x, const auto& y) { return std::memcmp(&x, &y, sizeof(x)) == 0; });
+    };
+    if (!sameLayout(inputs.vertexInput, recipe.vertexInput) || inputs.fragmentOutputs != recipe.fragmentOutputs || inputs.shaderStages != recipe.shaderStages) return miss(DrawRecipeMiss::ObjectsGone);
+    {
+        static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
+        if (DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, inputs.indexBytes, !trimKey) != recipe.key) return miss(DrawRecipeMiss::TemplateGone);
     }
     // The resident-target proof on the stored images (design_cpu_final 3.7): while an image is
     // still the storage cache's for its surface (StorageImageCached: the cache entry, removed under
@@ -2462,6 +2530,11 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         timer.phase(PhaseLookup);
         return miss(DrawRecipeMiss::Proof);
     }
+    auto moved = resources->MovedReadOnlyBuffers(shaders, *recorder);
+    if (!moved.has_value()) {
+        timer.phase(PhaseLookup);
+        return miss(DrawRecipeMiss::ObjectsGone);
+    }
     CheckBufferAliases(shaders, state.color, draw.indexAddress, inputs.indexBytes);
     SharedResourceCache().Touch(recipe.key);
     countCache(&DrawProfile::cacheHits);
@@ -2482,12 +2555,13 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     record.recorder = recorder;
     record.completion = outcome.completion;
     record.resources = std::move(resources);
+    record.moved = std::move(*moved);
     record.pipeline = std::move(pipeline);
     record.framebuffer = std::move(framebuffer);
     record.targetViews = recipe.targetViews;
     record.targets = std::move(targets);
-    record.pushBytes = &recipe.pushBytes;
-    record.pushStages = recipe.pushStages;
+    // This draw's own push constants (a shape hit's user data differ from the recipe's draw).
+    record.pushBytes = nullptr;
     recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs);
     if (profile) {
         result.recordUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - recordStart).count();

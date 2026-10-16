@@ -3729,7 +3729,13 @@ std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferM
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceReads() const {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
-    if (!uploaded || committed) return result;
+    InPlaceReadsInto(result);
+    return result;
+}
+
+void GuestBufferMemory::InPlaceReadsInto(std::vector<std::pair<std::uint64_t, std::uint64_t>>& result) const {
+    result.clear();
+    if (!uploaded || committed) return;
     if (space != nullptr) {
         for (const auto& region : space->base) {
             if (region.direct != nullptr) result.emplace_back(region.begin, region.end);
@@ -3738,7 +3744,13 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceR
     for (const auto& region : regions) {
         if (region.direct != nullptr) result.emplace_back(region.begin, region.end);
     }
-    return result;
+}
+
+bool GuestBufferMemory::InPlaceReadOverlaps(std::uint64_t address, std::size_t bytes) const {
+    if (!uploaded || committed) return false;
+    const auto overlaps = [&](const auto& region) { return region.direct != nullptr && address < region.end && region.begin < address + bytes; };
+    if (space != nullptr && std::any_of(space->base.begin(), space->base.end(), overlaps)) return true;
+    return std::any_of(regions.begin(), regions.end(), overlaps);
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::DeviceReads() const {

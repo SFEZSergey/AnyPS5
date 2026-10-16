@@ -44,7 +44,11 @@ void DrawPipeline::run() {
     if (setup) setup();
     std::unique_lock lock(mutex);
     for (;;) {
-        wake.wait(lock, [&] { return stopping || !jobs.empty(); });
+        if (!stopping && jobs.empty()) {
+            recorderWaiting = true;
+            wake.wait(lock, [&] { return stopping || !jobs.empty(); });
+            recorderWaiting = false;
+        }
         if (jobs.empty()) return;
         auto job = std::move(jobs.front());
         jobs.pop_front();
@@ -63,7 +67,7 @@ void DrawPipeline::run() {
         running.clear();
         if (error != nullptr && failure == nullptr) failure = error;
         pending.fetch_sub(1, std::memory_order_acq_rel);
-        done.notify_all();
+        if (workerWaiting != 0) done.notify_all();
     }
 }
 
@@ -72,7 +76,9 @@ void DrawPipeline::Enqueue(Job job) {
     if (failure != nullptr) std::rethrow_exception(failure);
     if (jobs.size() >= MaxQueuedJobs) {
         const auto start = Profiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        ++workerWaiting;
         done.wait(lock, [&] { return jobs.size() < MaxQueuedJobs || failure != nullptr; });
+        --workerWaiting;
         if (failure != nullptr) std::rethrow_exception(failure);
         if (Profiled()) {
             ++fullWaits;
@@ -82,8 +88,9 @@ void DrawPipeline::Enqueue(Job job) {
     jobs.push_back(std::move(job));
     pending.fetch_add(1, std::memory_order_acq_rel);
     ++enqueued;
+    const bool signal = recorderWaiting;
     lock.unlock();
-    wake.notify_one();
+    if (signal) wake.notify_one();
     if (Profiled()) report();
 }
 
@@ -92,7 +99,9 @@ void DrawPipeline::Drain(const char* reason) {
     ++drains;
     if (pending.load(std::memory_order_acquire) != 0) {
         const auto start = Profiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        ++workerWaiting;
         done.wait(lock, [&] { return pending.load(std::memory_order_acquire) == 0; });
+        --workerWaiting;
         if (Profiled()) {
             ++drainsWaited;
             drainWaitMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
