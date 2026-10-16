@@ -11,6 +11,7 @@
 #include "prx/libkernel/Equeue/Equeue.hpp"
 
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -22,6 +23,9 @@ namespace {
 
 Aps5Native::X86Caller caller = nullptr;
 std::array<std::uint64_t, Aps5Native::X86FunctionCount> functions{};
+// The x86 libc's generation counter, read in place (see GuestAllocationsGenerationCounter): the driver
+// checks the generation several times per draw, each a box64 RunFunction otherwise.
+const std::atomic<std::uint64_t>* generationCounter = nullptr;
 std::stop_source shutdownSource;
 
 std::uint64_t x86(Aps5Native::X86Function function, std::uint64_t a0 = 0, std::uint64_t a1 = 0, std::uint64_t a2 = 0, std::uint64_t a3 = 0, std::uint64_t a4 = 0, std::uint64_t a5 = 0) {
@@ -155,6 +159,7 @@ extern "C" void Aps5CoreShimInit(Aps5Native::X86Caller x86Caller, const std::uin
         for (std::uint64_t i = 0; i < count; ++i) std::fprintf(stderr, "[aps5native] x86 function %llu = 0x%llx\n", static_cast<unsigned long long>(i), static_cast<unsigned long long>(functions[i]));
     }
     x86(Aps5Native::RegisterShutdown, arg(&onShutdown));
+    generationCounter = reinterpret_cast<const std::atomic<std::uint64_t>*>(x86(Aps5Native::GuestAllocationsGenerationCounter));
 }
 
 // --- libkernel: очереди событий ---------------------------------------------------------------
@@ -220,7 +225,7 @@ extern "C" Lease GuestAllocationsAcquire_nid_postfix() {
     static const bool cached = std::getenv("APS5_LEASE_CACHE") != nullptr;
     if (!cached) return adoptLease(reinterpret_cast<void*>(x86(Aps5Native::LeaseAcquire)));
     // Поколение читается до снимка: изменение между ними даст новый ключ и новый снимок при следующем вызове.
-    const auto generation = x86(Aps5Native::GuestAllocationsGeneration);
+    const auto generation = GuestAllocationsGeneration_nid_postfix();
     {
         std::lock_guard lock(leaseCacheMutex);
         if (generation == leaseCacheGeneration) return leaseCache;
@@ -239,6 +244,7 @@ extern "C" std::uint64_t GuestAllocationsReadableEnd_nid_postfix(std::uintptr_t 
     return x86(Aps5Native::ReadableEnd, begin, end);
 }
 extern "C" std::uint64_t GuestAllocationsGeneration_nid_postfix() {
+    if (generationCounter != nullptr) return generationCounter->load(std::memory_order_acquire);
     return x86(Aps5Native::GuestAllocationsGeneration);
 }
 extern "C" void GuestAllocationsSetInvalidator_nid_postfix(void (*callback)(std::uintptr_t address, std::size_t bytes)) {

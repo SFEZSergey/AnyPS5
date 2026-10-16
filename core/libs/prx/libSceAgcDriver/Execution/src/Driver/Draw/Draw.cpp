@@ -38,9 +38,13 @@ struct DrawScratch {
     std::vector<std::uint64_t> recipeShape;
 
     void Release() {
-        programs.clear(); memory.clear(); linked.clear(); vertexInfos.clear(); decodeReads.clear();
+        // The per-program vectors are emptied, not destroyed: their capacity serves the next draw
+        // (destroying them here, often on the recorder thread, made every draw allocate them again).
+        for (auto& reads : decodeReads) reads.clear();
+        for (auto& regions : matchedRegions) regions.clear();
+        programs.clear(); memory.clear(); linked.clear(); vertexInfos.clear();
         results.clear(); stages.clear(); programResults.clear(); heldResults.clear(); stageCaptures.clear();
-        matched.clear(); matchedRegions.clear(); fresh.clear(); recompiled.clear(); pushOffsets.clear();
+        matched.clear(); fresh.clear(); recompiled.clear(); pushOffsets.clear();
         resultIndex.clear(); snapshots.clear(); recipeStages.clear(); recipeShape.clear();
     }
 };
@@ -428,7 +432,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     timing.Mark("shader_compile_and_link");
 
     for (const auto& reads : decodeReads) {
-        for (const auto& read : reads) memory.push_back({read.address, std::as_bytes(std::span(read.bytes))});
+        for (const auto& read : reads) memory.push_back({read.address, read.bytes()});
     }
 
     if (recordQueuedLabelsAfterCapture(submission.queue, memory)) return draw(queue, packet, submission, rejected);

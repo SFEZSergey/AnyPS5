@@ -228,6 +228,7 @@ void initializeCoreShim(Bridge& b) {
     table[Aps5Native::GuestArenaSharedBacking] = address(&GuestArena::GuestArenaSharedBacking_nid_postfix);
     table[Aps5Native::GuestArenaWriteSharedBacking] = address(&GuestArena::GuestArenaWriteSharedBacking_nid_no_patch);
     table[Aps5Native::GuestAllocationsGeneration] = address(&GuestAllocations::GuestAllocationsGeneration_nid_postfix);
+    table[Aps5Native::GuestAllocationsGenerationCounter] = address(&GuestAllocations::GuestAllocationsGenerationCounter_nid_no_patch);
     table[Aps5Native::LeaseAcquire] = address(&leaseAcquire);
     table[Aps5Native::LeaseCount] = address(&leaseCount);
     table[Aps5Native::LeaseAt] = address(&leaseAt);

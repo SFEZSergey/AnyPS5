@@ -211,7 +211,10 @@ ShaderRecompiler::ShaderVertexStageInfo DecodeVertexStageInfo(std::span<const st
         std::array<std::byte, 4> attribWordBytes{};
         const auto attribWordAddress = attribTableAddr + static_cast<std::uint64_t>(semantic.semantic) * 4u;
         AgcDriver::GuestMemory::Read(attribWordAddress, attribWordBytes, 4);
-        if (reads != nullptr) reads->push_back({attribWordAddress, {attribWordBytes.begin(), attribWordBytes.end()}});
+        if (reads != nullptr) {
+            DecodeRead& read = reads->emplace_back(DecodeRead{attribWordAddress, {}, 4});
+            std::memcpy(read.data.data(), attribWordBytes.data(), 4);
+        }
         std::uint32_t attribWord;
         std::memcpy(&attribWord, attribWordBytes.data(), 4);
         const auto index = attribWord & 0x1fu;
@@ -222,7 +225,10 @@ ShaderRecompiler::ShaderVertexStageInfo DecodeVertexStageInfo(std::span<const st
         std::array<std::byte, 16> sharpBytes{};
         const auto sharpAddress = bufferTableAddr + static_cast<std::uint64_t>(index) * 16u;
         AgcDriver::GuestMemory::Read(sharpAddress, sharpBytes, 4);
-        if (reads != nullptr) reads->push_back({sharpAddress, {sharpBytes.begin(), sharpBytes.end()}});
+        if (reads != nullptr) {
+            DecodeRead& read = reads->emplace_back(DecodeRead{sharpAddress, {}, 16});
+            std::memcpy(read.data.data(), sharpBytes.data(), 16);
+        }
         std::array<std::uint32_t, 4> sharp{};
         std::memcpy(sharp.data(), sharpBytes.data(), 16);
         if (info.resourcesNum >= ShaderRecompiler::ShaderVertexStageInfo::MaxResources) throw std::runtime_error("AGC graphics: vertex resource count exceeds the supported domain");

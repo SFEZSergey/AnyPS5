@@ -46,6 +46,9 @@ Lease GuestAllocationsAcquire_nid_postfix();
 Lease GuestAllocationsAcquireAll_nid_postfix();
 // Changes whenever a mutation ends, so callers can cache facts about guest mappings between changes.
 std::uint64_t GuestAllocationsGeneration_nid_postfix();
+// The counter behind GuestAllocationsGeneration (an 8-byte atomic): the Android native group reads it
+// directly instead of a call into x86 code per check (box64 RunFunction: sigsetjmp per call).
+const void* GuestAllocationsGenerationCounter_nid_no_patch();
 // Конец читаемого зарегистрированного диапазона, целиком содержащего [begin, end), или 0 — без снимка.
 std::uint64_t GuestAllocationsReadableEnd_nid_postfix(std::uintptr_t begin, std::uintptr_t end);
 // Precise invalidation for such caches: the callback runs, after the generation changed, for every

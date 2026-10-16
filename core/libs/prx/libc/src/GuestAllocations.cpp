@@ -146,6 +146,11 @@ std::uint64_t GuestAllocationsGeneration_nid_postfix() {
     return generation.load(std::memory_order_acquire);
 }
 
+const void* GuestAllocationsGenerationCounter_nid_no_patch() {
+    static_assert(sizeof(generation) == sizeof(std::uint64_t) && decltype(generation)::is_always_lock_free);
+    return &generation;
+}
+
 void GuestAllocationsSetInvalidator_nid_postfix(void (*callback)(std::uintptr_t, std::size_t)) {
     invalidator.store(callback, std::memory_order_release);
 }

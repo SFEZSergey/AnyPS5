@@ -46,6 +46,7 @@ enum X86Function : std::uint32_t {
     EqueuePushPending,           // void (x86 KernelEqueueEvent*, const KernelEvent*)
     RangeUnpinBatch,             // void (void** pins, u64 count): RangeUnpin пачкой (один переход в x86)
     ReadableEnd,                 // u64 (begin, end): конец читаемого диапазона, содержащего [begin, end), или 0
+    GuestAllocationsGenerationCounter, // const atomic<u64>* (): счётчик поколения, натив читает его сам
     X86FunctionCount
 };
 
