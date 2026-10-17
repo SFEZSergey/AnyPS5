@@ -68,6 +68,8 @@ private:
     bool waitingForDrain = false;
     std::exception_ptr failure;
     std::thread thread;
+    // Overlaps' sorted copy of the draw's regions (the worker is its only caller).
+    std::vector<Range> overlapScratch;
 
     // APS5_PROFILE_DRAW statistics (10 s).
     std::uint64_t enqueued = 0, drains = 0, drainsWaited = 0, fullWaits = 0;

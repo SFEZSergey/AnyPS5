@@ -8,8 +8,13 @@ namespace AgcDriver::DriverDetail {
 
 std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial) {
     static const bool allUserWords = std::getenv("APS5_DRAW_KEY_ALL_USER_WORDS") != nullptr;
-    std::uint64_t key = 0xcbf29ce484222325ull;
+    // Four FNV-1a lanes fed in turn, folded at the end: one chain made every multiply wait for the
+    // previous one over the few hundred registers a draw hashes (~6% of the worker on UI screens).
+    std::array<std::uint64_t, 4> lanes{0xcbf29ce484222325ull, 0x84222325cbf29ce4ull, 0x9e3779b97f4a7c15ull, 0xc2b2ae3d27d4eb4full};
+    std::size_t lane = 0;
     const auto mix = [&](std::uint64_t value) {
+        auto& key = lanes[lane];
+        lane = (lane + 1) & 3u;
         key ^= value;
         key *= 0x100000001b3ull;
     };
@@ -52,6 +57,12 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
         --it;
         for (const auto& snapshot : it->second) mix(reinterpret_cast<std::uintptr_t>(snapshot.get()));
         mix(address - it->first);
+    }
+    std::uint64_t key = 0xcbf29ce484222325ull;
+    for (const auto value : lanes) {
+        key ^= value;
+        key *= 0x100000001b3ull;
+        key ^= key >> 29u;
     }
     return key;
 }

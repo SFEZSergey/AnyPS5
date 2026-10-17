@@ -117,13 +117,24 @@ void DrawPipeline::Drain(const char* reason) {
 }
 
 bool DrawPipeline::Overlaps(std::span<const ShaderRecompiler::MemoryRegion> regions) {
-    if (Idle()) return false;
+    if (Idle() || regions.empty()) return false;
+    // The draw's regions sorted by start, with the running maximum of their ends: one write range is
+    // then a binary search instead of a pass over every region (every queued write x every region
+    // per draw was ~4% of the worker on UI screens).
+    auto& sorted = overlapScratch;
+    sorted.clear();
+    for (const auto& region : regions) sorted.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
+    std::sort(sorted.begin(), sorted.end());
+    for (std::size_t i = 1; i < sorted.size(); ++i) sorted[i].second = std::max(sorted[i].second, sorted[i - 1].second);
+    const auto hit = [&](std::uint64_t begin, std::uint64_t end) {
+        // Regions starting before `end`; the latest end among them decides.
+        const auto after = std::lower_bound(sorted.begin(), sorted.end(), end, [](const auto& region, std::uint64_t value) { return region.first < value; });
+        return after != sorted.begin() && std::prev(after)->second > begin;
+    };
     std::lock_guard lock(mutex);
     const auto overlaps = [&](const std::vector<Range>& writes) {
         for (const auto& [begin, end] : writes) {
-            for (const auto& region : regions) {
-                if (region.guestAddress < end && begin < region.guestAddress + region.bytes.size()) return true;
-            }
+            if (hit(begin, end)) return true;
         }
         return false;
     };
