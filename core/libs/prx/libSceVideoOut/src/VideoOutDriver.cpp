@@ -546,11 +546,22 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
         auto target = req.cfg->lastFlipVblank + interval;
         // APS5_FPS_LIMIT (the hub's FPS choice, against heat): flips no more often than that rate, on
         // the 59.94 Hz vblank clock; a fractional step (45 -> 1 1/3 vblanks) alternates intervals.
-        static const double limitStep = [] {
+        static const double baseLimit = [] {
             const char* value = std::getenv("APS5_FPS_LIMIT");
-            const double limit = value != nullptr ? std::strtod(value, nullptr) : 0.0;
-            return limit >= 1.0 && limit < 59.0 ? 60.0 / limit : 0.0;
+            return value != nullptr ? std::strtod(value, nullptr) : 0.0;
         }();
+        // APS5_FPS_CAP: the address of a cap the app changes while running (the Android build lowers
+        // it as the phone heats up, see GameActivity); the lower of the two limits applies.
+        static std::atomic<std::uint32_t>* const dynamicCap = [] {
+            const char* value = std::getenv("APS5_FPS_CAP");
+            return value != nullptr && value[0] != '\0' ? reinterpret_cast<std::atomic<std::uint32_t>*>(std::strtoull(value, nullptr, 16)) : nullptr;
+        }();
+        double limit = baseLimit;
+        if (dynamicCap != nullptr) {
+            const auto cap = static_cast<double>(dynamicCap->load(std::memory_order_relaxed));
+            if (cap >= 1.0 && (limit < 1.0 || cap < limit)) limit = cap;
+        }
+        const double limitStep = limit >= 1.0 && limit < 59.0 ? 60.0 / limit : 0.0;
         auto& nextAllowed = req.cfg->fpsLimitNext;
         if (limitStep > 0.0) target = std::max<uint64_t>(target, static_cast<uint64_t>(std::ceil(nextAllowed - 1e-6)));
         timing.Mark("validate");
