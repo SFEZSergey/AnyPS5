@@ -7,9 +7,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <utility>
 #include <string_view>
 #include <vector>
@@ -340,6 +342,83 @@ enum class DescriptorRole {
     ShaderData
 };
 
+// Per-element flags of a descriptor binding, inline up to 128 elements: a binding is copied for
+// every draw that materializes its stage (DescriptorBindingBuilder::Populate), and with eleven
+// std::vector<bool> members each copy was up to eleven heap allocations. The interface is the part
+// of std::vector<bool> the bindings use.
+class FlagVector {
+public:
+    class const_iterator {
+    public:
+        using iterator_category = std::forward_iterator_tag;
+        using value_type = bool;
+        using difference_type = std::ptrdiff_t;
+        using reference = bool;
+        using pointer = void;
+        const_iterator() = default;
+        const_iterator(const FlagVector* owner, std::size_t index) : owner(owner), index(index) {}
+        bool operator*() const { return (*owner)[index]; }
+        const_iterator& operator++() { ++index; return *this; }
+        const_iterator operator++(int) { auto previous = *this; ++index; return previous; }
+        bool operator==(const const_iterator& other) const { return index == other.index; }
+        bool operator!=(const const_iterator& other) const { return index != other.index; }
+    private:
+        const FlagVector* owner = nullptr;
+        std::size_t index = 0;
+    };
+
+    FlagVector() = default;
+    FlagVector(std::initializer_list<bool> flags) { for (const bool flag : flags) push_back(flag); }
+    FlagVector(const std::vector<bool>& flags) { for (const bool flag : flags) push_back(flag); }
+    FlagVector& operator=(const std::vector<bool>& flags) {
+        clear();
+        for (const bool flag : flags) push_back(flag);
+        return *this;
+    }
+
+    std::size_t size() const { return count; }
+    bool empty() const { return count == 0; }
+    void clear() {
+        count = 0;
+        inlineWords = {};
+        heapWords.clear();
+    }
+    void push_back(bool flag) {
+        const auto index = count++;
+        if (index / 64 >= InlineWords && heapWords.size() <= index / 64 - InlineWords) heapWords.push_back(0);
+        if (flag) word(index / 64) |= std::uint64_t{1} << (index % 64);
+    }
+    bool operator[](std::size_t index) const { return ((word(index / 64) >> (index % 64)) & 1u) != 0; }
+    bool at(std::size_t index) const {
+        if (index >= count) throw std::out_of_range("FlagVector::at");
+        return (*this)[index];
+    }
+    void set(std::size_t index, bool flag) {
+        if (index >= count) throw std::out_of_range("FlagVector::set");
+        auto& bits = word(index / 64);
+        const auto bit = std::uint64_t{1} << (index % 64);
+        bits = flag ? bits | bit : bits & ~bit;
+    }
+    const_iterator begin() const { return {this, 0}; }
+    const_iterator end() const { return {this, count}; }
+    bool operator==(const FlagVector& other) const {
+        if (count != other.count) return false;
+        for (std::size_t i = 0; i < (count + 63) / 64; ++i) {
+            if (word(i) != other.word(i)) return false;
+        }
+        return true;
+    }
+    bool operator!=(const FlagVector& other) const { return !(*this == other); }
+
+private:
+    static constexpr std::size_t InlineWords = 2;
+    std::uint64_t word(std::size_t index) const { return index < InlineWords ? inlineWords[index] : heapWords[index - InlineWords]; }
+    std::uint64_t& word(std::size_t index) { return index < InlineWords ? inlineWords[index] : heapWords[index - InlineWords]; }
+    std::array<std::uint64_t, InlineWords> inlineWords{};
+    std::vector<std::uint64_t> heapWords;
+    std::size_t count = 0;
+};
+
 struct DescriptorBinding {
     DescriptorKind kind;
     DescriptorRole role;
@@ -349,27 +428,27 @@ struct DescriptorBinding {
     std::vector<std::uint32_t> guestDescriptor;
     bool readOnly = false;
     std::optional<DescriptorImageShape> imageShape;
-    std::vector<bool> samplerDepthCompare;
+    FlagVector samplerDepthCompare;
     // Guest image elements the shader stores to (or updates atomically); the others are only read.
-    std::vector<bool> imageWritten;
-    std::vector<bool> imageDepthCompare;
-    std::vector<bool> imageAtomic;
-    std::vector<bool> imageAtomic64;
+    FlagVector imageWritten;
+    FlagVector imageDepthCompare;
+    FlagVector imageAtomic;
+    FlagVector imageAtomic64;
     // Guest buffer elements the shader updates atomically (one entry per element of a GuestBuffers
     // binding, empty otherwise). An atomic on a host-imported range is a serialized PCIe round trip
     // (~0.4-0.5 us each on NVIDIA), so a driver may keep these elements in device-local memory.
-    std::vector<bool> bufferAtomic;
+    FlagVector bufferAtomic;
     // Guest buffer elements the shader may store to through this V# (any store or atomic in the
     // program, whatever its offset), one entry per element of a GuestBuffers binding, empty
     // otherwise. A false entry is proved: every access of that element is a load. A driver may then
     // skip the write-back and the pending-write note for the element; an element beyond the vector
     // (a producer that does not fill it) must be treated as written.
-    std::vector<bool> bufferWritten;
-    std::vector<bool> samplerUnnormalized;
-    std::vector<bool> samplerIntegerBorder;
-    std::vector<bool> imageUnnormalized;
+    FlagVector bufferWritten;
+    FlagVector samplerUnnormalized;
+    FlagVector samplerIntegerBorder;
+    FlagVector imageUnnormalized;
     std::vector<std::uint32_t> imageSamplers;
-    std::vector<bool> bufferRead;
+    FlagVector bufferRead;
 };
 
 struct VertexAttribute {
