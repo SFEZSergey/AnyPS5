@@ -9,6 +9,10 @@ namespace {
 
 // Queued jobs hold their draw's prepared data; past this many the worker waits for the recorder.
 constexpr std::size_t MaxQueuedJobs = 32;
+// A sleeping recorder is woken once this many jobs wait (and at every drain): a futex wake per draw
+// was ~5% of the worker plus as much in the kernel. Every point where the worker may block (the end
+// of a submission, waits, labels, overlaps) drains, so no job is left behind.
+constexpr std::size_t WakeBatch = 4;
 
 bool Profiled() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -89,7 +93,7 @@ void DrawPipeline::Enqueue(Job job) {
     jobs.push_back(std::move(job));
     pending.fetch_add(1, std::memory_order_acq_rel);
     ++enqueued;
-    const bool signal = recorderWaiting;
+    const bool signal = recorderWaiting && jobs.size() >= WakeBatch;
     lock.unlock();
     if (signal) wake.notify_one();
     if (Profiled()) report();
@@ -99,6 +103,7 @@ void DrawPipeline::Drain(const char* reason) {
     std::unique_lock lock(mutex);
     ++drains;
     if (pending.load(std::memory_order_acquire) != 0) {
+        if (recorderWaiting && !jobs.empty()) wake.notify_one();
         const auto start = Profiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         waitingForDrain = true;
         done.wait(lock, [&] { return pending.load(std::memory_order_acquire) == 0; });

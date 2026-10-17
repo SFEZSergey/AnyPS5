@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_QUEUESTATE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_QUEUESTATE_HPP
 
+#include <algorithm>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -59,6 +60,39 @@ public:
     Registers(std::initializer_list<std::pair<std::uint32_t, std::uint32_t>> entries) {
         for (const auto& [offset, value] : entries) emplace(offset, value);
     }
+    // A copy or an assignment counts as a change of every register (see WordChanged).
+    Registers(const Registers& other) : values(other.values), present(other.present), entries(other.entries) {}
+    Registers(Registers&& other) noexcept : values(std::move(other.values)), present(std::move(other.present)), entries(other.entries) {
+        other.clear();
+    }
+    Registers& operator=(const Registers& other) {
+        if (this != &other) {
+            values = other.values;
+            present = other.present;
+            entries = other.entries;
+        }
+        everythingChanged = true;
+        return *this;
+    }
+    Registers& operator=(Registers&& other) noexcept {
+        if (this != &other) {
+            values = std::move(other.values);
+            present = std::move(other.present);
+            entries = other.entries;
+            other.clear();
+        }
+        everythingChanged = true;
+        return *this;
+    }
+
+    // Change tracking for values derived from the registers (Driver::drawRegisterKey keeps a hash
+    // per register range): a 64-register word counts as changed once any non-const access could
+    // have written it, every word after a clear or an assignment, until ForgetChanges.
+    bool WordChanged(std::size_t word) const { return everythingChanged || (word < changedWords.size() && changedWords[word] != 0); }
+    void ForgetChanges() const {
+        everythingChanged = false;
+        std::fill(changedWords.begin(), changedWords.end(), std::uint8_t{0});
+    }
 
     const_iterator begin() const { return {this, nextPresent(0)}; }
     const_iterator end() const { return {this, End}; }
@@ -72,7 +106,9 @@ public:
     void clear() {
         values.clear();
         present.clear();
+        changedWords.clear();
         entries = 0;
+        everythingChanged = true;
     }
     std::pair<const_iterator, bool> emplace(std::uint32_t offset, std::uint32_t value) {
         if (contains(offset)) return {const_iterator{this, offset}, false};
@@ -81,6 +117,7 @@ public:
     }
     std::pair<const_iterator, bool> insert_or_assign(std::uint32_t offset, std::uint32_t value) {
         if (contains(offset)) {
+            touch(offset);
             values[offset] = value;
             return {const_iterator{this, offset}, false};
         }
@@ -88,11 +125,15 @@ public:
         return {const_iterator{this, offset}, true};
     }
     std::uint32_t& operator[](std::uint32_t offset) {
-        if (contains(offset)) return values[offset];
+        if (contains(offset)) {
+            touch(offset);
+            return values[offset];
+        }
         return mark(offset) = 0;
     }
     std::uint32_t& at(std::uint32_t offset) {
         if (!contains(offset)) throw std::out_of_range("register is not set");
+        touch(offset);
         return values[offset];
     }
     const std::uint32_t& at(std::uint32_t offset) const {
@@ -101,6 +142,7 @@ public:
     }
     std::size_t erase(std::uint32_t offset) {
         if (!contains(offset)) return 0;
+        touch(offset);
         present[offset / 64] &= ~(std::uint64_t{1} << (offset % 64));
         --entries;
         return 1;
@@ -116,12 +158,19 @@ public:
 
 private:
     static constexpr std::size_t End = ~std::size_t{0};
+    void touch(std::uint32_t offset) {
+        const auto word = static_cast<std::size_t>(offset) / 64;
+        if (word < changedWords.size()) changedWords[word] = 1;
+        else everythingChanged = true;
+    }
     std::uint32_t& mark(std::uint32_t offset) {
         if (offset >= values.size()) {
             const auto words = static_cast<std::size_t>(offset) / 64 + 1;
             values.resize(words * 64, 0);
             present.resize(words, 0);
+            changedWords.resize(words, 1);
         }
+        touch(offset);
         present[offset / 64] |= std::uint64_t{1} << (offset % 64);
         ++entries;
         return values[offset];
@@ -137,6 +186,8 @@ private:
     std::vector<std::uint32_t> values;
     std::vector<std::uint64_t> present;
     std::size_t entries = 0;
+    mutable std::vector<std::uint8_t> changedWords;
+    mutable bool everythingChanged = true;
 };
 
 inline Registers BuildInitialContextRegisters() {
@@ -196,6 +247,13 @@ struct QueueState {
     std::uint32_t instanceCount = 1;
     std::vector<std::string> markers;
     Predication predication;
+    // Driver::drawRegisterKey's hash per DrawKeyRegisters range, reused while the range's register
+    // words are unchanged (Registers::WordChanged).
+    struct DrawKeyRanges {
+        std::array<std::uint64_t, 64> hashes{};
+        bool valid = false;
+    };
+    mutable DrawKeyRanges drawKeyRanges;
 
     void ClearContext() {
         context = InitialContextRegisters();

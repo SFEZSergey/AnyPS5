@@ -3,21 +3,13 @@
 #include <array>
 #include <cstdlib>
 #include <cstring>
+#include <tuple>
 
 namespace AgcDriver::DriverDetail {
 
 std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial) {
     static const bool allUserWords = std::getenv("APS5_DRAW_KEY_ALL_USER_WORDS") != nullptr;
-    // Four FNV-1a lanes fed in turn, folded at the end: one chain made every multiply wait for the
-    // previous one over the few hundred registers a draw hashes (~6% of the worker on UI screens).
-    std::array<std::uint64_t, 4> lanes{0xcbf29ce484222325ull, 0x84222325cbf29ce4ull, 0x9e3779b97f4a7c15ull, 0xc2b2ae3d27d4eb4full};
-    std::size_t lane = 0;
-    const auto mix = [&](std::uint64_t value) {
-        auto& key = lanes[lane];
-        lane = (lane + 1) & 3u;
-        key ^= value;
-        key *= 0x100000001b3ull;
-    };
+    constexpr std::uint64_t Prime = 0x100000001b3ull;
     const auto userEnd = [&](std::uint32_t base) {
         if (allUserWords) return base + 32u;
         const auto resources = queue.shader.find(base - 1);
@@ -29,18 +21,42 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
     const auto unread = [&](std::uint32_t offset) {
         return std::any_of(users.begin(), users.end(), [&](const auto& user) { return offset >= user.second && offset < user.first + 32u; });
     };
-    mix(deviceSerial);
-    for (const auto& range : Graphics::DrawKeyRegisters) {
+    // One hash per range, recomputed only when a register word of the range changed since the last
+    // key (most draws change a few user words): hashing every range's few hundred registers was ~6%
+    // of the worker on UI screens. A range's hash depends on its own registers only (the user counts
+    // that decide the unread words lie in the same shader ranges as the words).
+    auto& cache = queue.drawKeyRanges;
+    static_assert(Graphics::DrawKeyRegisters.size() <= std::tuple_size_v<decltype(cache.hashes)>);
+    for (std::size_t index = 0; index < Graphics::DrawKeyRegisters.size(); ++index) {
+        const auto& range = Graphics::DrawKeyRegisters[index];
         const auto& bank = range.bank == Graphics::RegisterBank::Context ? queue.context : range.bank == Graphics::RegisterBank::Shader ? queue.shader : queue.userConfig;
-        mix((static_cast<std::uint64_t>(range.bank) << 32u) | range.first);
         const auto end = range.first + range.count;
+        if (cache.valid) {
+            bool changed = false;
+            for (std::size_t word = range.first / 64u; word <= (end - 1u) / 64u; ++word) changed = changed || bank.WordChanged(word);
+            if (!changed) continue;
+        }
+        std::uint64_t hash = (0xcbf29ce484222325ull ^ ((static_cast<std::uint64_t>(range.bank) << 32u) | range.first)) * Prime;
         const bool shader = range.bank == Graphics::RegisterBank::Shader;
         for (auto it = bank.lower_bound(range.first); it != bank.end() && it->first < end; ++it) {
             if (shader && unread(it->first)) continue;
-            mix(it->first);
-            mix(it->second);
+            hash = (hash ^ it->first) * Prime;
+            hash = (hash ^ it->second) * Prime;
         }
+        cache.hashes[index] = hash;
     }
+    cache.valid = true;
+    queue.context.ForgetChanges();
+    queue.shader.ForgetChanges();
+    queue.userConfig.ForgetChanges();
+
+    std::uint64_t key = 0xcbf29ce484222325ull;
+    const auto mix = [&](std::uint64_t value) {
+        key ^= value;
+        key *= Prime;
+    };
+    mix(deviceSerial);
+    for (std::size_t index = 0; index < Graphics::DrawKeyRegisters.size(); ++index) mix(cache.hashes[index]);
     for (const auto base : {0x008u, 0x088u, 0x0c8u, 0x108u, 0x148u}) {
         const auto low = queue.shader.find(base);
         const auto high = queue.shader.find(base + 1);
@@ -57,12 +73,6 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
         --it;
         for (const auto& snapshot : it->second) mix(reinterpret_cast<std::uintptr_t>(snapshot.get()));
         mix(address - it->first);
-    }
-    std::uint64_t key = 0xcbf29ce484222325ull;
-    for (const auto value : lanes) {
-        key ^= value;
-        key *= 0x100000001b3ull;
-        key ^= key >> 29u;
     }
     return key;
 }
