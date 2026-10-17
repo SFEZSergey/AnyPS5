@@ -117,8 +117,11 @@ public:
     }
     std::pair<const_iterator, bool> insert_or_assign(std::uint32_t offset, std::uint32_t value) {
         if (contains(offset)) {
-            touch(offset);
-            values[offset] = value;
+            // The title rewrites most state per draw with the same values: only a new value is a change.
+            if (values[offset] != value) {
+                touch(offset);
+                values[offset] = value;
+            }
             return {const_iterator{this, offset}, false};
         }
         mark(offset) = value;

@@ -9,10 +9,6 @@ namespace {
 
 // Queued jobs hold their draw's prepared data; past this many the worker waits for the recorder.
 constexpr std::size_t MaxQueuedJobs = 32;
-// A sleeping recorder is woken once this many jobs wait (and at every drain): a futex wake per draw
-// was ~5% of the worker plus as much in the kernel. Every point where the worker may block (the end
-// of a submission, waits, labels, overlaps) drains, so no job is left behind.
-constexpr std::size_t WakeBatch = 4;
 
 bool Profiled() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -93,7 +89,10 @@ void DrawPipeline::Enqueue(Job job) {
     jobs.push_back(std::move(job));
     pending.fetch_add(1, std::memory_order_acq_rel);
     ++enqueued;
-    const bool signal = recorderWaiting && jobs.size() >= WakeBatch;
+    // A sleeping recorder is woken at once: waking it only once four jobs waited (to save the futex
+    // wake per draw) left it idle while the worker queued, and a drain then waited for all of them
+    // serially (menu 51 -> 47 FPS).
+    const bool signal = recorderWaiting;
     lock.unlock();
     if (signal) wake.notify_one();
     if (Profiled()) report();
